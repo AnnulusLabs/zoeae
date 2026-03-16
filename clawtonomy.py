@@ -776,6 +776,8 @@ HELP = """\
 {B2}Exp:{R}   /experiment <dir> [fast [deep]] | /experiment auto <dir> [hours]
        /experiment tree — show solution tree
 {B2}Sess:{R}  /status /services /postmortem [quick] /provenance /block
+{B2}Mail:{R}  /mail <to> <subject> <body> | /sms <number> <msg> | /mail setup
+{B2}Dev:{R}   /devices — scan ADB, fastboot, serial, network
 {B2}Other:{R} /clear /save /q
 """
 
@@ -931,6 +933,43 @@ def main():
                     f'val_bpb={result.get("val_bpb")} node={result.get("id")}')
             out('system', _exp_runner.summary())
             provenance('experiment', _exp_runner.summary())
+        elif cmd == 'mail':
+            try:
+                from kerf.nerve.mail import send_email
+                parts_m = arg.split(None, 2)
+                if not parts_m or parts_m[0] == 'setup':
+                    from kerf.nerve.mail import setup as mail_setup
+                    mail_setup()
+                elif len(parts_m) >= 3:
+                    ok = send_email(parts_m[0], parts_m[1], parts_m[2])
+                    out('system', 'Sent' if ok else 'Failed')
+                    provenance('mail', f'to={parts_m[0]} ok={ok}')
+                else:
+                    out('system', '/mail <to> <subject> <body> | /mail setup')
+            except ImportError:
+                out('system', 'kerf.nerve.mail not found')
+        elif cmd == 'sms':
+            try:
+                from kerf.nerve.mail import send_sms
+                parts_m = arg.split(None, 1)
+                if len(parts_m) >= 2:
+                    ok = send_sms(parts_m[0], parts_m[1])
+                    out('system', 'Sent' if ok else 'Failed')
+                    provenance('sms', f'to={parts_m[0]} ok={ok}')
+                else:
+                    out('system', '/sms <number> <message>')
+            except ImportError:
+                out('system', 'kerf.nerve.mail not found')
+        elif cmd == 'devices':
+            try:
+                import subprocess
+                r = subprocess.run(['python', 'A:/AI/RIGHT_TO_UPGRADE.py', 'scan'],
+                                   capture_output=True, text=True, timeout=30)
+                if r.stdout: print(r.stdout)
+                if r.stderr: out('system', r.stderr[:300])
+                provenance('devices_scan', f'rc={r.returncode}')
+            except Exception as e:
+                out('system', f'Device scan failed: {e}')
         else: out('system', f'Unknown: /{cmd}')
 
     if room: room.save()
