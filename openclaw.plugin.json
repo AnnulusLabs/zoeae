@@ -1,0 +1,117 @@
+{
+  "id": "clawtonomy",
+  "name": "Clawtonomy",
+  "description": "Autonomous cognitive agent — genome memory, shell execution, file I/O, task queue, multi-model rooms (7 modes incl. sparse-debate, Free-MAD, vote), goal planning, service monitoring, background daemon, real-time activity logging. No holds barred.",
+  "kind": "tool",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "autonomyUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8766",
+        "description": "AUTONOMY v3.0 service URL"
+      },
+      "bootTier": {
+        "type": "number",
+        "default": 0,
+        "description": "StressCompiler tier (0=NUCLEUS, 1=CELL, 2=ORGANISM, 3=ECOSYSTEM)"
+      },
+      "maxTokens": {
+        "type": "number",
+        "default": 0,
+        "description": "Auto-tier budget (0 = use bootTier)"
+      },
+      "autoConsolidate": {
+        "type": "boolean",
+        "default": true,
+        "description": "Auto-extract knowledge on /new and /reset"
+      },
+      "recordTurns": {
+        "type": "boolean",
+        "default": true,
+        "description": "Record conversation turns to genome"
+      },
+      "injectNucleus": {
+        "type": "boolean",
+        "default": true,
+        "description": "Inject NUCLEUS context on agent bootstrap"
+      },
+      "injectTasks": {
+        "type": "boolean",
+        "default": true,
+        "description": "Inject pending tasks on agent bootstrap"
+      },
+      "injectPlan": {
+        "type": "boolean",
+        "default": true,
+        "description": "Inject active plan on agent bootstrap"
+      },
+      "injectServices": {
+        "type": "boolean",
+        "default": true,
+        "description": "Inject service health alerts on agent bootstrap"
+      },
+      "daemonAutoStart": {
+        "type": "boolean",
+        "default": false,
+        "description": "Start autonomous daemon on gateway startup"
+      },
+      "daemonIntervalMs": {
+        "type": "number",
+        "default": 300000,
+        "description": "Daemon tick interval in ms (default 5 minutes)"
+      },
+      "ollamaUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:11434",
+        "description": "Ollama API URL for room models and delegation"
+      },
+      "ollamaTimeoutMs": {
+        "type": "number",
+        "default": 120000,
+        "description": "Ollama request timeout in ms"
+      },
+      "breadthModel": {
+        "type": "string",
+        "default": "hermes3:8b",
+        "description": "Cheap model for breadth operations (planning, voting)"
+      },
+      "depthModel": {
+        "type": "string",
+        "default": "deepseek-r1:32b",
+        "description": "Expensive model for depth operations (step expansion, structural jumps)"
+      },
+      "defaultModel": {
+        "type": "string",
+        "default": "hermes3:8b",
+        "description": "Default model for delegation and daemon task processing"
+      },
+      "activityLogEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Enable real-time activity logging"
+      },
+      "mcpEnabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "Start MCP server on gateway startup (port 8768)"
+      },
+      "mcpPort": {
+        "type": "number",
+        "default": 8768,
+        "description": "MCP server port"
+      },
+      "dashboardEnabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "Start telemetry dashboard on gateway startup (port 8769)"
+      },
+      "dashboardPort": {
+        "type": "number",
+        "default": 8769,
+        "description": "Telemetry dashboard port"
+      }
+    }
+  }
+}
