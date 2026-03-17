@@ -975,7 +975,32 @@ def main():
     if room: room.save()
     session.save()
     provenance('end', f'prompts={session.d["prompts"]}')
-    print(f'\n{D}Closed. /postmortem to analyze.{RST}')
+
+    # Cross-session continuity: write ANNULUS_STATE.md for Ghost Protocol
+    try:
+        state_path = Path('A:/AI/ANNULUS_STATE.md')
+        lines = [f'# Session State — {datetime.now().isoformat()[:19]}']
+        lines.append(f'\n## Resume\nSession {session.d["id"]}, {session.d["prompts"]} prompts')
+        if session.d.get('models'):
+            lines.append(f'Models used: {", ".join(session.d["models"][:6])}')
+        if session.d.get('rooms'):
+            lines.append(f'Rooms: {", ".join(session.d["rooms"])}')
+        # Incomplete experiment state
+        if _exp_runner and _exp_runner.tree:
+            best = _exp_runner._best_node()
+            lines.append(f'\n## Experiment\n{_exp_runner.summary()}')
+            lines.append(f'Work dir: {_exp_runner.work_dir}')
+            lines.append(f'Best node: {best["id"]} ({best["hypothesis"][:60]})')
+        # Recent history as context
+        if session.d.get('history'):
+            lines.append('\n## Recent')
+            for h in session.d['history'][-5:]:
+                lines.append(f'- {h.get("ts","?")[11:19]} [{h.get("room","?")}/{h.get("mode","?")}] {h.get("prompt","")[:60]}')
+        state_path.write_text('\n'.join(lines), encoding='utf-8')
+    except Exception:
+        pass
+
+    print(f'\n{D}Closed. State saved to ANNULUS_STATE.md{RST}')
 
 if __name__ == '__main__':
     main()
