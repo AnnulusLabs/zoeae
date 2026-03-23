@@ -40,6 +40,9 @@ export type Task = {
 export class TaskEngine {
   private tasks: Map<string, Task> = new Map();
   private filePath: string;
+  private _dirty = false;
+  private _saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private static SAVE_DEBOUNCE_MS = 2_000;
 
   constructor(filePath: string) {
     this.filePath = filePath;
@@ -57,7 +60,19 @@ export class TaskEngine {
     } catch { /* fresh start */ }
   }
 
+  /** Debounced save — coalesces rapid state changes into one write */
   save(): void {
+    this._dirty = true;
+    if (this._saveTimer) return;
+    this._saveTimer = setTimeout(() => {
+      this._saveTimer = null;
+      if (this._dirty) this.saveNow();
+    }, TaskEngine.SAVE_DEBOUNCE_MS);
+  }
+
+  /** Immediate save — use when you need guaranteed persistence */
+  saveNow(): void {
+    this._dirty = false;
     try {
       mkdirSync(dirname(this.filePath), { recursive: true });
       writeFileSync(this.filePath, JSON.stringify({

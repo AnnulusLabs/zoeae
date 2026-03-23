@@ -1,5 +1,5 @@
 /**
- * Clawtonomy — Autonomous Cognitive Agent for OpenClaw
+ * Zoeae — Autonomous Cognitive Agent for OpenClaw
  *
  * Full AGI toolbox: genome memory, shell execution, file I/O,
  * task queue, planning, multi-model rooms, service health,
@@ -30,7 +30,7 @@ import { Planner } from "./src/planner.js";
 import { checkAllServices, restartService, formatServiceStatus } from "./src/services.js";
 import { Daemon } from "./src/daemon.js";
 import { McpServer } from "./src/mcp-server.js";
-import { Dashboard } from "./src/dashboard.js";
+import { renderDashboard } from "./src/dashboard.js";
 import { join } from "node:path";
 
 // ═══════════════════════════════════════════════════════════════
@@ -57,8 +57,6 @@ type ClawConfig = {
   activityLogEnabled: boolean;
   mcpEnabled: boolean;
   mcpPort: number;
-  dashboardEnabled: boolean;
-  dashboardPort: number;
 };
 
 function resolveConfig(raw?: Record<string, unknown>): ClawConfig {
@@ -82,8 +80,6 @@ function resolveConfig(raw?: Record<string, unknown>): ClawConfig {
     activityLogEnabled: raw?.activityLogEnabled !== false,
     mcpEnabled: raw?.mcpEnabled === true,
     mcpPort: Number(raw?.mcpPort ?? 8768),
-    dashboardEnabled: raw?.dashboardEnabled === true,
-    dashboardPort: Number(raw?.dashboardPort ?? 8769),
   };
 }
 
@@ -116,9 +112,9 @@ const WORKSPACE = join(process.env.HOME ?? process.env.USERPROFILE ?? ".", ".ope
 // PLUGIN REGISTRATION
 // ═══════════════════════════════════════════════════════════════
 
-const clawtonomy = {
-  id: "clawtonomy",
-  name: "Clawtonomy",
+const zoeae = {
+  id: "zoeae",
+  name: "Zoeae",
   description: "Autonomous cognitive agent — genome memory, shell execution, task queue, multi-model rooms, planning, service monitoring, background daemon",
   kind: "tool" as const,
   configSchema: emptyPluginConfigSchema(),
@@ -134,7 +130,7 @@ const clawtonomy = {
     let _daemon: Daemon | null = null;
     let _log: ActivityLog | null = null;
     let _mcp: McpServer | null = null;
-    let _dashboard: Dashboard | null = null;
+    // Dashboard is now stateless — renderDashboard() called on demand via tool
 
     function getCfg(): ClawConfig {
       if (!_cfg) _cfg = resolveConfig(api.config as Record<string, unknown> | undefined);
@@ -153,12 +149,12 @@ const clawtonomy = {
       return _log;
     }
     function getTasks(): TaskEngine {
-      if (!_tasks) _tasks = new TaskEngine(join(WORKSPACE, ".clawtonomy", "tasks.json"));
+      if (!_tasks) _tasks = new TaskEngine(join(WORKSPACE, ".zoeae", "tasks.json"));
       return _tasks;
     }
     function getPlanner(): Planner {
       if (!_planner) _planner = new Planner(
-        join(WORKSPACE, ".clawtonomy", "plans.json"),
+        join(WORKSPACE, ".zoeae", "plans.json"),
         getCfg().ollamaUrl,
         getCfg().breadthModel,
         getCfg().depthModel,
@@ -166,12 +162,16 @@ const clawtonomy = {
       return _planner;
     }
     function getDaemon(): Daemon {
-      if (!_daemon) _daemon = new Daemon(getTasks(), getClient(), getLog(), {
-        enabled: getCfg().daemonAutoStart,
-        intervalMs: getCfg().daemonIntervalMs,
-        ollamaUrl: getCfg().ollamaUrl,
-        defaultModel: getCfg().defaultModel,
-      });
+      if (!_daemon) {
+        _daemon = new Daemon(getTasks(), getClient(), getLog(), {
+          enabled: getCfg().daemonAutoStart,
+          intervalMs: getCfg().daemonIntervalMs,
+          ollamaUrl: getCfg().ollamaUrl,
+          defaultModel: getCfg().defaultModel,
+        });
+        // Phase 3: inject planner for executeGoal()
+        _daemon.setPlanner(getPlanner());
+      }
       return _daemon;
     }
 
@@ -203,7 +203,7 @@ const clawtonomy = {
     // ═══════════════════════════════════════════════════════
 
     // ─── agent:bootstrap → inject NUCLEUS + tasks + plan + service status ───
-    api.registerHook("agent:bootstrap", { name: "clawtonomy:bootstrap" }, async (event) => {
+    api.registerHook("agent:bootstrap", { name: "zoeae:bootstrap" }, async (event) => {
       const cfg = getCfg();
       const ctx = event.context as { bootstrapFiles?: Array<{ path: string; content: string }> };
       if (!ctx.bootstrapFiles) return;
@@ -268,7 +268,7 @@ const clawtonomy = {
 
       if (sections.length > 0) {
         ctx.bootstrapFiles.push({
-          path: "CLAWTONOMY.md",
+          path: "ZOEAE.md",
           content: sections.join("\n\n---\n\n"),
         });
       }
@@ -279,7 +279,7 @@ const clawtonomy = {
     // ─── message:received → record user turn + proactive context injection ───
     let _firstMessageInjected = false;
 
-    api.registerHook("message:received", { name: "clawtonomy:record-user" }, async (event) => {
+    api.registerHook("message:received", { name: "zoeae:record-user" }, async (event) => {
       const ctx = event.context as {
         content?: string;
         bootstrapFiles?: Array<{ path: string; content: string }>;
@@ -337,7 +337,7 @@ const clawtonomy = {
     });
 
     // ─── message:sent → record assistant turn ───
-    api.registerHook("message:sent", { name: "clawtonomy:record-assistant" }, async (event) => {
+    api.registerHook("message:sent", { name: "zoeae:record-assistant" }, async (event) => {
       if (!getCfg().recordTurns) return;
       const ctx = event.context as { content?: string };
       if (!ctx.content) return;
@@ -345,7 +345,7 @@ const clawtonomy = {
     });
 
     // ─── command:new / command:reset → consolidate + save state ───
-    api.registerHook("command:new", { name: "clawtonomy:consolidate-new" }, async () => {
+    api.registerHook("command:new", { name: "zoeae:consolidate-new" }, async () => {
       _firstMessageInjected = false; // reset for next session
       if (!getCfg().autoConsolidate) return;
       try { await getClient().consolidate(true); } catch { /* silent */ }
@@ -354,7 +354,7 @@ const clawtonomy = {
       getLog().emit("genome_event", "session end: consolidated + saved state");
     });
 
-    api.registerHook("command:reset", { name: "clawtonomy:consolidate-reset" }, async () => {
+    api.registerHook("command:reset", { name: "zoeae:consolidate-reset" }, async () => {
       _firstMessageInjected = false; // reset for next session
       if (!getCfg().autoConsolidate) return;
       try { await getClient().consolidate(true); } catch { /* silent */ }
@@ -364,8 +364,8 @@ const clawtonomy = {
     });
 
     // ─── gateway:startup → health check + daemon ───
-    api.registerHook("gateway:startup", { name: "clawtonomy:startup" }, async () => {
-      getLog().emit("info", "clawtonomy loaded");
+    api.registerHook("gateway:startup", { name: "zoeae:startup" }, async () => {
+      getLog().emit("info", "zoeae loaded");
 
       // Health check
       try {
@@ -391,18 +391,7 @@ const clawtonomy = {
         } catch (e) { getLog().emit("error", `MCP start failed: ${e}`); }
       }
 
-      // Upgrade #8: Start telemetry dashboard
-      if (getCfg().dashboardEnabled) {
-        try {
-          _dashboard = new Dashboard({
-            port: getCfg().dashboardPort,
-            host: "127.0.0.1",
-            activityLogPath: join(WORKSPACE, "activity.jsonl"),
-          });
-          _dashboard.start();
-          getLog().emit("info", `Dashboard started at http://127.0.0.1:${getCfg().dashboardPort}/`);
-        } catch (e) { getLog().emit("error", `Dashboard start failed: ${e}`); }
-      }
+      // Upgrade #8: Telemetry readout (TUI — invoke via dashboard tool)
     });
 
     // ═══════════════════════════════════════════════════════
@@ -768,7 +757,8 @@ const clawtonomy = {
               return { content: daemon.stop() ? "Daemon stopped." : "Daemon not running." };
             case "status": {
               const s = daemon.status();
-              return { content: `Daemon: ${s.running ? "RUNNING" : "STOPPED"} | Ticks: ${s.tickCount} | Interval: ${s.config.intervalMs / 1000}s` };
+              const vs = s.validationStats;
+              return { content: `Daemon: ${s.running ? "RUNNING" : "STOPPED"} | Ticks: ${s.tickCount} | Interval: ${s.config.intervalMs / 1000}s | Eval: ${s.config.evalModel}\nTicking: ${s.ticking} | Last Ollama calls: ${s.ollamaCallsLastTick}/${s.config.maxOllamaCallsPerTick}\nValidation: ${vs.passed} passed, ${vs.failed} failed, avg conf=${vs.avgConfidence.toFixed(2)}, threshold=${s.adaptiveThreshold.toFixed(2)}` };
             }
             case "tick": {
               const result = await daemon.tick();
@@ -1087,6 +1077,55 @@ const clawtonomy = {
     );
 
     // ═══════════════════════════════════════════════════════
+    // TOOLS — Goal Execution (Phase 3)
+    // ═══════════════════════════════════════════════════════
+
+    api.registerTool(
+      () => ({
+        name: "goal",
+        description:
+          "Execute a complex goal autonomously. Decomposes the goal into a plan using local models, " +
+          "then executes each step with the full inner loop: validate → reformulate → retry. " +
+          "Uses room-backed validation for critical steps, genome-informed reformulation, " +
+          "plan-aware validation, and adaptive thresholds. Max 2 replans, 20 steps. " +
+          "This is the top-level autonomy primitive — give it a goal, it figures out the rest.",
+        parameters: {
+          type: "object" as const,
+          properties: {
+            goal: { type: "string", description: "The goal to achieve (e.g., 'set up a Python project with tests')" },
+            context: { type: "string", description: "Optional context, constraints, or prior knowledge" },
+          },
+          required: ["goal"],
+        },
+        async execute(args: { goal: string; context?: string }) {
+          const daemon = getDaemon();
+          const log = getLog();
+
+          log.emit("goal_start", `goal tool invoked: ${args.goal.slice(0, 80)}`);
+
+          try {
+            const result = await daemon.executeGoal(args.goal, args.context);
+            const stepLines = result.results.map((r, i) =>
+              `  ${i + 1}. [${r.status.toUpperCase().padEnd(9)}] ${r.step.slice(0, 60)}${r.status === "failed" ? ` — ${r.result.slice(0, 60)}` : ""}`
+            );
+
+            return {
+              content: [
+                `Goal: ${result.goal}`,
+                `Status: ${result.status.toUpperCase()} | ${result.stepsCompleted}/${result.stepsTotal} steps | ${result.replans} replans | ${result.durationMs}ms`,
+                "",
+                ...stepLines,
+              ].join("\n"),
+            };
+          } catch (err) {
+            return { content: `Goal execution failed: ${err}` };
+          }
+        },
+      }),
+      { names: ["goal"] },
+    );
+
+    // ═══════════════════════════════════════════════════════
     // TOOLS — Cross-Device Sync (Upgrade #7)
     // ═══════════════════════════════════════════════════════
 
@@ -1136,7 +1175,7 @@ const clawtonomy = {
     );
 
     // ═══════════════════════════════════════════════════════
-    // TOOLS — MCP & Dashboard Control (Upgrades #5, #8)
+    // TOOLS — MCP & Telemetry (Upgrades #5, #8)
     // ═══════════════════════════════════════════════════════
 
     api.registerTool(
@@ -1144,7 +1183,7 @@ const clawtonomy = {
         name: "mcp",
         description:
           "Control the MCP (Model Context Protocol) server. When running, any MCP client " +
-          "(Claude Code, Cursor, Windsurf, custom agents) can use Clawtonomy's tools. " +
+          "(Claude Code, Cursor, Windsurf, custom agents) can use Zoeae's tools. " +
           "Actions: start, stop, status.",
         parameters: {
           type: "object" as const,
@@ -1178,36 +1217,16 @@ const clawtonomy = {
       () => ({
         name: "dashboard",
         description:
-          "Control the telemetry dashboard. Shows tool call frequency, model latency, " +
+          "Telemetry readout. Shows tool call frequency, model latency, " +
           "task completion rates, room mode usage, service uptime. " +
-          "Actions: start, stop, status.",
+          "Pure terminal output. No webapp.",
         parameters: {
           type: "object" as const,
-          properties: {
-            action: { type: "string", description: "start|stop|status" },
-          },
-          required: ["action"],
+          properties: {},
         },
-        async execute(args: { action: string }) {
-          switch (args.action) {
-            case "start": {
-              if (_dashboard?.isRunning()) return { content: "Dashboard already running." };
-              _dashboard = new Dashboard({
-                port: getCfg().dashboardPort,
-                host: "127.0.0.1",
-                activityLogPath: join(WORKSPACE, "activity.jsonl"),
-              });
-              const ok = _dashboard.start();
-              if (ok) getLog().emit("info", `Dashboard started at http://127.0.0.1:${getCfg().dashboardPort}/`);
-              return { content: ok ? `Dashboard at http://127.0.0.1:${getCfg().dashboardPort}/` : "Failed to start." };
-            }
-            case "stop":
-              return { content: _dashboard?.stop() ? "Dashboard stopped." : "Not running." };
-            case "status":
-              return { content: _dashboard?.isRunning() ? `Dashboard running at http://127.0.0.1:${getCfg().dashboardPort}/` : "Dashboard not running." };
-            default:
-              return { content: `Unknown: ${args.action}. Use: start, stop, status` };
-          }
+        async execute() {
+          const output = renderDashboard(join(WORKSPACE, "activity.jsonl"));
+          return { content: output };
         },
       }),
       { names: ["dashboard"] },
@@ -1224,7 +1243,7 @@ const clawtonomy = {
 
         g.command("stats").description("Genome statistics").action(async () => {
           try {
-            console.log("\n  CLAWTONOMY — Genome\n");
+            console.log("\n  ZOEAE — Genome\n");
             console.log("  " + formatStats(await getClient().stats()).split("\n").join("\n  "));
             console.log();
           } catch (e) { console.error(`  Error: ${e}\n  Is AUTONOMY running?`); }
@@ -1236,7 +1255,7 @@ const clawtonomy = {
             try {
               const { nucleus, tier } = await getClient().boot(parseInt(opts.tier, 10));
               const names = ["NUCLEUS", "CELL", "ORGANISM", "ECOSYSTEM"];
-              console.log(`\n  CLAWTONOMY — ${names[tier]}\n`);
+              console.log(`\n  ZOEAE — ${names[tier]}\n`);
               console.log(nucleus);
               console.log();
             } catch (e) { console.error(`  Error: ${e}`); }
@@ -1254,7 +1273,7 @@ const clawtonomy = {
 
         rm.command("status").description("Show room status").action(async () => {
           const room = getRoom();
-          console.log(`\n  CLAWTONOMY — Room\n`);
+          console.log(`\n  ZOEAE — Room\n`);
           console.log(`  Name:    ${room.name}`);
           console.log(`  Mode:    ${room.mode}`);
           console.log(`  Models:  [${room.models.join(", ") || "none"}]`);
@@ -1266,7 +1285,7 @@ const clawtonomy = {
         rm.command("models").description("List available Ollama models").action(async () => {
           const models = await getOllama().listModels();
           const room = getRoom();
-          console.log(`\n  CLAWTONOMY — Available Models\n`);
+          console.log(`\n  ZOEAE — Available Models\n`);
           for (const m of models) {
             const inRoom = room.models.includes(m.name) ? " [IN ROOM]" : "";
             console.log(`  ${m.name} (${m.parameter_size ?? "?"})${inRoom}`);
@@ -1278,7 +1297,7 @@ const clawtonomy = {
         const t = program.command("tasks").description("Task queue management");
 
         t.command("list").description("List all tasks").action(async () => {
-          console.log("\n  CLAWTONOMY — Tasks\n");
+          console.log("\n  ZOEAE — Tasks\n");
           console.log("  " + getTasks().format().split("\n").join("\n  "));
           console.log();
         });
@@ -1306,7 +1325,7 @@ const clawtonomy = {
 
         // ─── openclaw services ───
         program.command("services").description("Service health check").action(async () => {
-          console.log("\n  CLAWTONOMY — Services\n");
+          console.log("\n  ZOEAE — Services\n");
           const statuses = await checkAllServices();
           console.log("  " + formatServiceStatus(statuses).split("\n").join("\n  "));
           console.log();
@@ -1317,4 +1336,4 @@ const clawtonomy = {
   },
 };
 
-export default clawtonomy;
+export default zoeae;

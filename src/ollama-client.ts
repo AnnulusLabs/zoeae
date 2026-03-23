@@ -15,6 +15,12 @@ export type OllamaModel = {
   parameter_size?: string;
 };
 
+export type ChatResult = {
+  ok: boolean;
+  content: string;
+  error?: string;
+};
+
 export class OllamaClient {
   private baseUrl: string;
   private timeoutMs: number;
@@ -24,7 +30,8 @@ export class OllamaClient {
     this.timeoutMs = timeoutMs;
   }
 
-  async chat(model: string, messages: OllamaChatMessage[]): Promise<string> {
+  /** Structured chat — returns {ok, content, error} so callers can distinguish failures */
+  async chatResult(model: string, messages: OllamaChatMessage[]): Promise<ChatResult> {
     const ac = new AbortController();
     const t = setTimeout(() => ac.abort(), this.timeoutMs);
     try {
@@ -34,14 +41,24 @@ export class OllamaClient {
         body: JSON.stringify({ model, messages, stream: false }),
         signal: ac.signal,
       });
-      if (!r.ok) throw new Error(`Ollama ${r.status}: ${await r.text().catch(() => "")}`);
+      if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        return { ok: false, content: "", error: `Ollama ${r.status}: ${body}` };
+      }
       const data = (await r.json()) as { message?: { content?: string } };
-      return data.message?.content?.trim() ?? "";
+      const content = data.message?.content?.trim() ?? "";
+      return { ok: true, content };
     } catch (err) {
-      return `[ERROR] ${err}`;
+      return { ok: false, content: "", error: String(err) };
     } finally {
       clearTimeout(t);
     }
+  }
+
+  /** Legacy string-return chat — preserved for backward compat */
+  async chat(model: string, messages: OllamaChatMessage[]): Promise<string> {
+    const r = await this.chatResult(model, messages);
+    return r.ok ? r.content : `[ERROR] ${r.error}`;
   }
 
   async listModels(): Promise<OllamaModel[]> {

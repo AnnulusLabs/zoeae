@@ -1,21 +1,38 @@
 /**
- * Telemetry Dashboard — Real-time HTML dashboard for activity observability
+ * Telemetry Dashboard — Terminal readout for activity observability
  *
- * Upgrade #8: Aggregates activity.jsonl into tool call frequency,
- * delegation latency per model, task completion rates, genome growth,
- * room mode usage, service uptime.
+ * Aggregates activity.jsonl into tool call frequency, delegation latency
+ * per model, task completion rates, genome growth, room mode usage,
+ * service uptime.
  *
- * Served as a single-page HTML — no dependencies, no React, just template literals.
+ * Pure ANSI output. No webapp. No browser. No dependencies.
  *
  * AnnulusLabs LLC
  */
 
-import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 
+// ── ANSI NOX palette ──────────────────────────────────────────────
+const RST = "\x1b[0m";
+const BLD = "\x1b[1m";
+const DIM = "\x1b[2m";
+const INV = "\x1b[7m";
+
+const GREEN  = "\x1b[38;2;0;255;136m";
+const RED    = "\x1b[38;2;255;51;102m";
+const BLUE   = "\x1b[38;2;102;119;170m";
+const GREY   = "\x1b[38;2;100;100;100m";
+const WHITE  = "\x1b[38;2;255;255;255m";
+const GOLD   = "\x1b[38;2;255;204;0m";
+const CYAN   = "\x1b[38;2;51;204;255m";
+const ORANGE = "\x1b[38;2;255;153;51m";
+const PURPLE = "\x1b[38;2;204;102;255m";
+const MINT   = "\x1b[38;2;102;255;204m";
+
+const BG_BAR = "\x1b[48;2;20;20;35m";
+
+// ── Types ─────────────────────────────────────────────────────────
 export type DashboardConfig = {
-  port: number;
-  host: string;
   activityLogPath: string;
 };
 
@@ -30,6 +47,7 @@ type AggregatedStats = {
   timeRange: { first: string; last: string };
 };
 
+// ── Aggregation (unchanged) ───────────────────────────────────────
 function aggregate(logPath: string): AggregatedStats {
   const stats: AggregatedStats = {
     totalEntries: 0,
@@ -57,10 +75,8 @@ function aggregate(logPath: string): AggregatedStats {
   }
 
   for (const e of entries) {
-    // By kind
     stats.byKind[e.kind] = (stats.byKind[e.kind] ?? 0) + 1;
 
-    // Delegation latency
     if (e.kind === "delegate_result" && e.durationMs && e.meta?.model) {
       const model = String(e.meta.model);
       if (!stats.avgLatencyByModel[model]) stats.avgLatencyByModel[model] = { total: 0, count: 0, avg: 0 };
@@ -68,20 +84,17 @@ function aggregate(logPath: string): AggregatedStats {
       stats.avgLatencyByModel[model].count++;
     }
 
-    // Task stats
     if (e.kind === "task_event") {
       if (e.summary?.includes("completed")) stats.taskStats.completed++;
       if (e.summary?.includes("failed")) stats.taskStats.failed++;
       if (e.summary?.includes("blocked")) stats.taskStats.blocked++;
     }
 
-    // Room mode usage
     if (e.kind === "delegate" && e.summary?.includes("room query")) {
       const modeMatch = e.summary.match(/\[(\w[\w-]*)\]/);
       if (modeMatch) stats.roomModeUsage[modeMatch[1]] = (stats.roomModeUsage[modeMatch[1]] ?? 0) + 1;
     }
 
-    // Service health
     if (e.kind === "service_check") {
       const nameMatch = e.summary?.match(/^(\w+)/);
       if (nameMatch) {
@@ -93,7 +106,6 @@ function aggregate(logPath: string): AggregatedStats {
     }
   }
 
-  // Compute averages
   for (const m of Object.values(stats.avgLatencyByModel)) {
     m.avg = m.count > 0 ? Math.round(m.total / m.count) : 0;
   }
@@ -102,138 +114,159 @@ function aggregate(logPath: string): AggregatedStats {
     s.uptime = `${upPct}%`;
   }
 
-  // Recent entries (last 30)
-  stats.recentEntries = entries.slice(-30).reverse().map((e) => ({
+  stats.recentEntries = entries.slice(-20).reverse().map((e) => ({
     ts: e.ts?.slice(11, 19) ?? "??:??:??",
     kind: e.kind,
-    summary: (e.summary ?? "").slice(0, 120),
+    summary: (e.summary ?? "").slice(0, 90),
     durationMs: e.durationMs,
   }));
 
   return stats;
 }
 
-function renderHtml(stats: AggregatedStats): string {
-  const kindRows = Object.entries(stats.byKind)
-    .sort((a, b) => b[1] - a[1])
-    .map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`)
-    .join("");
-
-  const latencyRows = Object.entries(stats.avgLatencyByModel)
-    .sort((a, b) => b[1].avg - a[1].avg)
-    .map(([m, v]) => `<tr><td>${m}</td><td>${v.avg}ms</td><td>${v.count}</td></tr>`)
-    .join("");
-
-  const serviceRows = Object.entries(stats.serviceHealth)
-    .map(([n, v]) => `<tr><td>${n}</td><td>${v.uptime}</td><td>${v.checks}</td><td>${v.failures}</td></tr>`)
-    .join("");
-
-  const modeRows = Object.entries(stats.roomModeUsage)
-    .sort((a, b) => b[1] - a[1])
-    .map(([m, v]) => `<tr><td>${m}</td><td>${v}</td></tr>`)
-    .join("");
-
-  const activityRows = stats.recentEntries
-    .map((e) => {
-      const dur = e.durationMs ? ` <span style="color:#888">(${e.durationMs}ms)</span>` : "";
-      return `<tr><td style="white-space:nowrap">${e.ts}</td><td><code>${e.kind}</code></td><td>${e.summary}${dur}</td></tr>`;
-    }).join("");
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Clawtonomy — Telemetry</title>
-<meta http-equiv="refresh" content="10">
-<style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{background:#0d1117;color:#c9d1d9;font:13px/1.5 'Cascadia Code','Fira Code',monospace;padding:20px}
-  h1{color:#58a6ff;font-size:18px;margin-bottom:16px}
-  h2{color:#8b949e;font-size:14px;margin:16px 0 8px;border-bottom:1px solid #21262d;padding-bottom:4px}
-  .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px}
-  .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px}
-  .stat{font-size:24px;color:#58a6ff;font-weight:bold}
-  .label{color:#8b949e;font-size:11px;text-transform:uppercase}
-  table{width:100%;border-collapse:collapse;font-size:12px}
-  th{text-align:left;color:#8b949e;border-bottom:1px solid #21262d;padding:4px 8px}
-  td{padding:4px 8px;border-bottom:1px solid #161b22}
-  code{background:#1f2937;padding:2px 4px;border-radius:3px;color:#7ee787;font-size:11px}
-  .ok{color:#3fb950} .err{color:#f85149}
-</style>
-</head>
-<body>
-<h1>CLAWTONOMY — Telemetry Dashboard</h1>
-<div style="color:#8b949e;margin-bottom:16px;font-size:11px">
-  ${stats.timeRange.first ? `Range: ${stats.timeRange.first.slice(0,19)} → ${stats.timeRange.last.slice(0,19)}` : "No data yet"}
-  &nbsp;|&nbsp; Auto-refreshes every 10s
-</div>
-<div class="grid">
-  <div class="card"><div class="stat">${stats.totalEntries}</div><div class="label">Total Events</div></div>
-  <div class="card"><div class="stat">${stats.taskStats.completed} <span class="ok">✓</span> / ${stats.taskStats.failed} <span class="err">✗</span></div><div class="label">Tasks Completed / Failed</div></div>
-  <div class="card"><div class="stat">${Object.keys(stats.roomModeUsage).length}</div><div class="label">Room Modes Used</div></div>
-</div>
-
-<div class="grid">
-  <div class="card">
-    <h2>Events by Type</h2>
-    <table><tr><th>Kind</th><th>Count</th></tr>${kindRows || "<tr><td colspan=2>No data</td></tr>"}</table>
-  </div>
-  <div class="card">
-    <h2>Model Latency</h2>
-    <table><tr><th>Model</th><th>Avg</th><th>Calls</th></tr>${latencyRows || "<tr><td colspan=3>No data</td></tr>"}</table>
-  </div>
-  <div class="card">
-    <h2>Services</h2>
-    <table><tr><th>Name</th><th>Uptime</th><th>Checks</th><th>Fails</th></tr>${serviceRows || "<tr><td colspan=4>No data</td></tr>"}</table>
-  </div>
-</div>
-
-<div class="card" style="margin-bottom:16px">
-  <h2>Room Mode Usage</h2>
-  <table><tr><th>Mode</th><th>Queries</th></tr>${modeRows || "<tr><td colspan=2>No data</td></tr>"}</table>
-</div>
-
-<div class="card">
-  <h2>Recent Activity</h2>
-  <table><tr><th>Time</th><th>Kind</th><th>Summary</th></tr>${activityRows || "<tr><td colspan=3>No data</td></tr>"}</table>
-</div>
-</body></html>`;
+// ── ANSI rendering helpers ────────────────────────────────────────
+function bar(text: string, width = 80): string {
+  const padded = ` ${text} `.padEnd(width);
+  return `${BG_BAR}${WHITE}${BLD}${padded}${RST}`;
 }
 
-export class Dashboard {
-  private server: ReturnType<typeof createServer> | null = null;
-  private cfg: DashboardConfig;
-  private running = false;
+function sectionHeader(title: string): string {
+  return `${GREEN}${BLD}${title}${RST}`;
+}
 
-  constructor(config: DashboardConfig) {
+function tableRow(cols: string[], widths: number[]): string {
+  return cols.map((c, i) => c.padEnd(widths[i])).join("  ");
+}
+
+function sparkBar(value: number, max: number, width = 20): string {
+  if (max === 0) return GREY + "░".repeat(width) + RST;
+  const filled = Math.round((value / max) * width);
+  return GREEN + "█".repeat(filled) + GREY + "░".repeat(width - filled) + RST;
+}
+
+function modelColor(model: string): string {
+  const m = model.toLowerCase();
+  if (m.includes("qwen")) return GOLD;
+  if (m.includes("llama")) return CYAN;
+  if (m.includes("hermes") || m.includes("phi")) return ORANGE;
+  if (m.includes("deepseek")) return PURPLE;
+  if (m.includes("mistral") || m.includes("codestral") || m.includes("devstral")) return MINT;
+  if (m.includes("gemma")) return "\x1b[38;2;255;102;153m";
+  return WHITE;
+}
+
+function kindColor(kind: string): string {
+  if (kind.includes("error") || kind.includes("fail")) return RED;
+  if (kind.includes("complete") || kind.includes("success")) return GREEN;
+  if (kind.includes("delegate")) return CYAN;
+  if (kind.includes("task")) return ORANGE;
+  if (kind.includes("service")) return BLUE;
+  return GREY;
+}
+
+// ── Main render ───────────────────────────────────────────────────
+export function renderDashboard(logPath: string): string {
+  const s = aggregate(logPath);
+  const W = 80;
+  const lines: string[] = [];
+
+  // ── Header bar ──
+  lines.push("");
+  lines.push(bar("ZOEAE  TELEMETRY", W));
+  if (s.timeRange.first) {
+    lines.push(`${DIM}  ${s.timeRange.first.slice(0, 19)} -> ${s.timeRange.last.slice(0, 19)}  |  ${s.totalEntries} events${RST}`);
+  } else {
+    lines.push(`${DIM}  No data yet${RST}`);
+  }
+  lines.push("");
+
+  // ── Summary stats ──
+  const completed = `${GREEN}${s.taskStats.completed}${RST}`;
+  const failed = `${RED}${s.taskStats.failed}${RST}`;
+  const blocked = `${ORANGE}${s.taskStats.blocked}${RST}`;
+  const modes = Object.keys(s.roomModeUsage).length;
+  lines.push(`  ${BLD}Tasks${RST}  ${completed} done  ${failed} failed  ${blocked} blocked    ${BLD}Room Modes${RST}  ${CYAN}${modes}${RST}`);
+  lines.push("");
+
+  // ── Events by type ──
+  const kindEntries = Object.entries(s.byKind).sort((a, b) => b[1] - a[1]);
+  if (kindEntries.length > 0) {
+    lines.push(sectionHeader("  EVENTS"));
+    const maxKind = Math.max(...kindEntries.map(([, v]) => v));
+    for (const [kind, count] of kindEntries) {
+      const label = kind.padEnd(22);
+      const num = String(count).padStart(5);
+      lines.push(`  ${GREY}${label}${RST} ${num}  ${sparkBar(count, maxKind, 30)}`);
+    }
+    lines.push("");
+  }
+
+  // ── Model latency ──
+  const latencyEntries = Object.entries(s.avgLatencyByModel).sort((a, b) => b[1].avg - a[1].avg);
+  if (latencyEntries.length > 0) {
+    lines.push(sectionHeader("  MODEL LATENCY"));
+    lines.push(`  ${DIM}${tableRow(["Model", "Avg", "Calls"], [28, 10, 6])}${RST}`);
+    for (const [model, v] of latencyEntries) {
+      const mc = modelColor(model);
+      const name = model.length > 26 ? model.slice(0, 24) + ".." : model;
+      lines.push(`  ${mc}${name.padEnd(28)}${RST} ${WHITE}${(v.avg + "ms").padStart(10)}${RST} ${DIM}${String(v.count).padStart(6)}${RST}`);
+    }
+    lines.push("");
+  }
+
+  // ── Services ──
+  const svcEntries = Object.entries(s.serviceHealth);
+  if (svcEntries.length > 0) {
+    lines.push(sectionHeader("  SERVICES"));
+    for (const [name, v] of svcEntries) {
+      const pct = parseInt(v.uptime);
+      const color = pct >= 95 ? GREEN : pct >= 70 ? ORANGE : RED;
+      lines.push(`  ${WHITE}${name.padEnd(16)}${RST} ${color}${v.uptime.padStart(5)}${RST}  ${DIM}${v.checks} checks  ${v.failures} fails${RST}`);
+    }
+    lines.push("");
+  }
+
+  // ── Room mode usage ──
+  const modeEntries = Object.entries(s.roomModeUsage).sort((a, b) => b[1] - a[1]);
+  if (modeEntries.length > 0) {
+    lines.push(sectionHeader("  ROOM MODES"));
+    const maxMode = Math.max(...modeEntries.map(([, v]) => v));
+    for (const [mode, count] of modeEntries) {
+      lines.push(`  ${CYAN}${mode.padEnd(16)}${RST} ${String(count).padStart(4)}  ${sparkBar(count, maxMode, 20)}`);
+    }
+    lines.push("");
+  }
+
+  // ── Recent activity ──
+  if (s.recentEntries.length > 0) {
+    lines.push(sectionHeader("  RECENT ACTIVITY"));
+    for (const e of s.recentEntries) {
+      const dur = e.durationMs ? `${DIM}(${e.durationMs}ms)${RST}` : "";
+      const kc = kindColor(e.kind);
+      const kindTag = e.kind.padEnd(18);
+      lines.push(`  ${DIM}${e.ts}${RST}  ${kc}${kindTag}${RST} ${e.summary.slice(0, 60)} ${dur}`);
+    }
+    lines.push("");
+  }
+
+  lines.push(`${DIM}${"─".repeat(W)}${RST}`);
+  return lines.join("\n");
+}
+
+// ── Legacy compat: Dashboard class now just wraps renderDashboard ──
+export class Dashboard {
+  private cfg: DashboardConfig & { port?: number; host?: string };
+
+  constructor(config: DashboardConfig & { port?: number; host?: string }) {
     this.cfg = config;
   }
 
-  start(): boolean {
-    if (this.running) return false;
-    this.server = createServer((req, res) => {
-      if (req.url === "/api/stats") {
-        const stats = aggregate(this.cfg.activityLogPath);
-        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify(stats));
-        return;
-      }
-      const stats = aggregate(this.cfg.activityLogPath);
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(renderHtml(stats));
-    });
-    this.server.listen(this.cfg.port, this.cfg.host);
-    this.running = true;
-    return true;
+  render(): string {
+    return renderDashboard(this.cfg.activityLogPath);
   }
 
-  stop(): boolean {
-    if (!this.running || !this.server) return false;
-    this.server.close();
-    this.server = null;
-    this.running = false;
-    return true;
-  }
-
-  isRunning(): boolean { return this.running; }
+  // Stubs for backward compat — no-op since we killed the server
+  start(): boolean { return true; }
+  stop(): boolean { return true; }
+  isRunning(): boolean { return false; }
 }

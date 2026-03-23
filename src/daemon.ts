@@ -1,24 +1,29 @@
 /**
  * Autonomous Daemon — Background loop that runs between conversations
  *
- * Patterns pulled from:
- *   OpenClaw daemon            — self-healing automation loop
- *   OpenClaw autonomy          — agent spawning + task processing
- *   DDL_AUTORESEARCH_SPEC.md  — overnight experiment pattern
+ * Phase 1: validate → reformulate → retry (single replan max)
+ * Phase 2: room-backed validation, genome-informed reformulation
+ * Phase 3: executeGoal() with StepContext, plan-aware validation,
+ *          adaptive thresholds, compression pipeline
  *
- * Processes task queue, monitors service health, auto-restarts,
- * consolidates genome. The thing that makes it autonomous.
+ * Safeguards: tick mutex, exit-code-is-truth, command denylist,
+ *             Ollama call cap, replan depth limit, step cap.
  *
  * AnnulusLabs LLC
  */
 
-import { TaskEngine } from "./task-engine.js";
+import { TaskEngine, type Task } from "./task-engine.js";
+import { Planner, type Plan, type PlanStep } from "./planner.js";
 import { checkAllServices, restartService } from "./services.js";
 import { shellExec } from "./executor.js";
-import { OllamaClient } from "./ollama-client.js";
+import { OllamaClient, type ChatResult } from "./ollama-client.js";
 import { AutonomyClient } from "./autonomy-client.js";
 import { ActivityLog } from "./activity-log.js";
 import { join } from "node:path";
+
+// ═══════════════════════════════════════════════════════════════════════
+// CONFIG
+// ═══════════════════════════════════════════════════════════════════════
 
 export type DaemonConfig = {
   enabled: boolean;
@@ -30,31 +35,120 @@ export type DaemonConfig = {
   consolidateEveryNTicks: number;
   ollamaUrl: string;
   defaultModel: string;
+  evalModel: string;
+  maxOllamaCallsPerTick: number;
+  tickTimeBudgetMs: number;
+  // Phase 2
+  roomValidationModels: string[];
+  roomValidationThreshold: number;   // 0-1, fraction of models that must pass
+  genomeSearchOnReplan: boolean;
+  // Phase 3
+  maxGoalSteps: number;
+  maxGoalReplans: number;
+  adaptiveThresholds: boolean;
 };
 
 const DEFAULTS: DaemonConfig = {
   enabled: false,
-  intervalMs: 300_000,       // 5 minutes
+  intervalMs: 300_000,
   taskProcessing: true,
   healthMonitoring: true,
   autoRestart: true,
   maxTasksPerTick: 3,
-  consolidateEveryNTicks: 6, // every 30 min
+  consolidateEveryNTicks: 6,
   ollamaUrl: "http://127.0.0.1:11434",
   defaultModel: "hermes3:8b",
+  evalModel: "phi4-mini-reasoning",
+  maxOllamaCallsPerTick: 10,
+  tickTimeBudgetMs: 120_000,
+  // Phase 2
+  roomValidationModels: ["hermes3:8b", "mistral:latest", "phi4-mini-reasoning"],
+  roomValidationThreshold: 0.6,
+  genomeSearchOnReplan: true,
+  // Phase 3
+  maxGoalSteps: 20,
+  maxGoalReplans: 2,
+  adaptiveThresholds: true,
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+// SAFEGUARDS
+// ═══════════════════════════════════════════════════════════════════════
+
+const COMMAND_DENYLIST = [
+  "rm -rf /", "rm -rf ~", "rm -rf .", "dd if=", "dd of=",
+  "mkfs", "diskpart", ":(){", "chmod -R 777 /",
+  "Clear-Disk", "Disable-PnpDevice", "Format-Volume",
+  "> /dev/sda", "shutdown", "reboot", "init 0", "init 6",
+];
+
+function isCommandBlocked(cmd: string): string | null {
+  const lower = cmd.toLowerCase();
+  for (const pat of COMMAND_DENYLIST) {
+    if (lower.includes(pat.toLowerCase())) return pat;
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// TYPES
+// ═══════════════════════════════════════════════════════════════════════
+
+type ValidationResult = {
+  pass: boolean;
+  confidence: number;
+  critique: string;
+  suggestion: string;
+};
+
+/** Phase 3: Compressed state carried through multi-step goal execution */
+type StepContext = {
+  goalId: string;
+  goal: string;
+  planId: string;
+  stepIndex: number;
+  totalSteps: number;
+  completedSteps: string[];       // compressed: "step N: outcome (Xms)"
+  failedSteps: string[];          // compressed: "step N: reason"
+  cumulativeMetrics: Record<string, number>;  // running tallies
+  genomeFacts: string[];          // relevant facts pulled at goal start
+  adaptedThreshold: number;       // validation threshold, adjusted per-step
+};
+
+/** Phase 3: Goal execution result */
+export type GoalResult = {
+  goalId: string;
+  goal: string;
+  planId: string;
+  status: "completed" | "partial" | "failed" | "aborted";
+  stepsCompleted: number;
+  stepsTotal: number;
+  replans: number;
+  results: Array<{ step: string; status: string; result: string }>;
+  durationMs: number;
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// DAEMON
+// ═══════════════════════════════════════════════════════════════════════
 
 export class Daemon {
   private timer: ReturnType<typeof setInterval> | null = null;
   private cfg: DaemonConfig;
   private tasks: TaskEngine;
+  private planner: Planner | null = null;
   private ollama: OllamaClient;
   private autonomy: AutonomyClient;
   private log: ActivityLog;
   private running = false;
   private tickCount = 0;
-  private _lastMessageAt = 0;       // Upgrade #4: idle tracking
-  private _deepConsolidated = false; // Upgrade #4: once per idle period
+  private _lastMessageAt = 0;
+  private _deepConsolidated = false;
+  private _ticking = false;
+  private _ollamaCallsThisTick = 0;
+  private _replanCounts = new Map<string, number>(); // task ID → replan count
+  // Phase 3: genome-learned validation stats
+  private _validationStats = { passed: 0, failed: 0, avgConfidence: 0.7 };
 
   constructor(
     tasks: TaskEngine,
@@ -67,6 +161,11 @@ export class Daemon {
     this.autonomy = autonomy;
     this.log = log;
     this.ollama = new OllamaClient(this.cfg.ollamaUrl, 120_000);
+  }
+
+  /** Inject planner for Phase 3 goal execution */
+  setPlanner(planner: Planner): void {
+    this.planner = planner;
   }
 
   start(): boolean {
@@ -91,26 +190,424 @@ export class Daemon {
 
   isRunning(): boolean { return this.running; }
 
-  /** Upgrade #4: Call from message:received hook to track activity */
   touchActivity(): void {
     this._lastMessageAt = Date.now();
-    this._deepConsolidated = false; // new activity resets deep consolidation
+    this._deepConsolidated = false;
   }
 
-  /** Upgrade #4: Idle time in ms since last message */
   idleMs(): number {
     return this._lastMessageAt > 0 ? Date.now() - this._lastMessageAt : Infinity;
   }
 
-  /** Run one tick manually (also called by timer) */
+  // ═══════════════════════════════════════════════════════════════════
+  // GUARDED OLLAMA
+  // ═══════════════════════════════════════════════════════════════════
+
+  private async guardedChat(model: string, messages: Array<{ role: "system" | "user" | "assistant"; content: string }>): Promise<ChatResult> {
+    if (this._ollamaCallsThisTick >= this.cfg.maxOllamaCallsPerTick) {
+      return { ok: false, content: "", error: "Ollama call cap reached for this tick" };
+    }
+    this._ollamaCallsThisTick++;
+    return this.ollama.chatResult(model, messages);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // PHASE 1: VALIDATION GATE
+  // ═══════════════════════════════════════════════════════════════════
+
+  private async validateResult(task: Task, result: string, exitCode?: number): Promise<ValidationResult> {
+    if (task.taskType === "shell" && exitCode === 0) {
+      const evalResult = await this.guardedChat(this.cfg.evalModel, [
+        { role: "system", content: 'You evaluate task results. Output ONLY valid JSON: {"confidence":0.0-1.0,"critique":"...","suggestion":"..."}' },
+        { role: "user", content: `Task: ${task.name}\nDescription: ${task.description.slice(0, 500)}\nResult (exit 0):\n${result.slice(0, 1000)}` },
+      ]);
+      if (evalResult.ok) {
+        try {
+          const parsed = JSON.parse(evalResult.content.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
+          return { pass: true, confidence: parsed.confidence ?? 1.0, critique: parsed.critique ?? "", suggestion: parsed.suggestion ?? "" };
+        } catch { /* parse fail, still pass */ }
+      }
+      return { pass: true, confidence: 1.0, critique: "", suggestion: "" };
+    }
+
+    const evalResult = await this.guardedChat(this.cfg.evalModel, [
+      { role: "system", content: 'You evaluate whether a task completed successfully. Output ONLY valid JSON: {"pass":true/false,"confidence":0.0-1.0,"critique":"one sentence","suggestion":"how to fix if failed"}' },
+      { role: "user", content: `Task: ${task.name}\nType: ${task.taskType}\nDescription: ${task.description.slice(0, 500)}\nResult:\n${result.slice(0, 1000)}` },
+    ]);
+
+    if (!evalResult.ok) {
+      this.log.emit("inner_loop", `eval failed for ${task.id}: ${evalResult.error}`);
+      return { pass: true, confidence: 0.5, critique: "evaluation unavailable", suggestion: "" };
+    }
+
+    try {
+      const parsed = JSON.parse(evalResult.content.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
+      const v: ValidationResult = {
+        pass: Boolean(parsed.pass),
+        confidence: Math.min(1, Math.max(0, Number(parsed.confidence) || 0.5)),
+        critique: String(parsed.critique ?? "").slice(0, 300),
+        suggestion: String(parsed.suggestion ?? "").slice(0, 300),
+      };
+      // Phase 3: Update adaptive stats
+      this._validationStats[v.pass ? "passed" : "failed"]++;
+      const total = this._validationStats.passed + this._validationStats.failed;
+      this._validationStats.avgConfidence = (this._validationStats.avgConfidence * (total - 1) + v.confidence) / total;
+      return v;
+    } catch {
+      this.log.emit("inner_loop", `eval parse failed for ${task.id}, passing through`);
+      return { pass: true, confidence: 0.5, critique: "parse error", suggestion: "" };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // PHASE 2: ROOM-BACKED VALIDATION
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Multi-model adversarial validation for high-priority tasks */
+  private async validateWithRoom(task: Task, result: string): Promise<ValidationResult> {
+    const models = this.cfg.roomValidationModels;
+    if (models.length < 2) return this.validateResult(task, result);
+
+    this.log.emit("inner_room", `room validation for ${task.id}: ${models.length} models`);
+
+    const prompt = `Task: ${task.name}\nDescription: ${task.description.slice(0, 400)}\nResult:\n${result.slice(0, 800)}\n\nDid this task succeed? Output ONLY valid JSON: {"pass":true/false,"confidence":0.0-1.0,"critique":"one sentence"}`;
+
+    const responses = await Promise.all(
+      models.map((m) => this.guardedChat(m, [
+        { role: "system", content: "You are a critical evaluator. Judge whether a task result is correct and complete. Be harsh but fair." },
+        { role: "user", content: prompt },
+      ])),
+    );
+
+    let passes = 0;
+    let totalConf = 0;
+    const critiques: string[] = [];
+    const suggestions: string[] = [];
+
+    for (let i = 0; i < responses.length; i++) {
+      const r = responses[i];
+      if (!r.ok) continue;
+      try {
+        const parsed = JSON.parse(r.content.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
+        if (parsed.pass) passes++;
+        totalConf += Number(parsed.confidence) || 0.5;
+        if (parsed.critique) critiques.push(`[${models[i].split(":")[0]}] ${parsed.critique}`);
+        if (parsed.suggestion) suggestions.push(String(parsed.suggestion));
+      } catch { /* skip unparseable */ }
+    }
+
+    const validResponses = responses.filter((r) => r.ok).length || 1;
+    const passRate = passes / validResponses;
+    const pass = passRate >= this.cfg.roomValidationThreshold;
+    const confidence = totalConf / validResponses;
+
+    this.log.emit("inner_room", `${task.id} room verdict: ${passes}/${validResponses} pass (${(passRate * 100).toFixed(0)}%), conf=${confidence.toFixed(2)}`);
+
+    return {
+      pass,
+      confidence,
+      critique: critiques.join("; ").slice(0, 500),
+      suggestion: suggestions[0]?.slice(0, 300) ?? "",
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // PHASE 2: GENOME-INFORMED REFORMULATION
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Search genome for past failures before reformulating */
+  private async reformulateWithGenome(task: Task, critique: string, suggestion: string): Promise<string> {
+    let genomeContext = "";
+
+    if (this.cfg.genomeSearchOnReplan) {
+      try {
+        if (await this.autonomy.ping()) {
+          const keywords = task.name.toLowerCase().split(/\s+/).slice(0, 3).join(" ");
+          const { results } = await this.autonomy.searchFacts(`TASK_FAILURE ${keywords}`, 5);
+          if (results && results.length > 0) {
+            genomeContext = "\n\nPast failures (from genome):\n" +
+              results.map((r) => `- ${r.content.slice(0, 150)}`).join("\n");
+            this.log.emit("inner_genome", `found ${results.length} past failures for "${keywords}"`);
+          }
+        }
+      } catch (e) { this.log.emit("error", `genome search failed: ${e}`); }
+    }
+
+    const r = await this.guardedChat(this.cfg.evalModel, [
+      { role: "system", content: "Rewrite this task description to address the critique and avoid past mistakes. Output ONLY the improved task description." },
+      { role: "user", content: `Original: ${task.description.slice(0, 500)}\nCritique: ${critique}\nSuggestion: ${suggestion}${genomeContext}\n\nImproved task description:` },
+    ]);
+    if (!r.ok || r.content.length < 10) {
+      this.log.emit("inner_replan", `reformulation failed for ${task.id}, keeping original`);
+      return task.description;
+    }
+    this.log.emit("inner_replan", `${task.id} reformulated${genomeContext ? " (genome-informed)" : ""}`);
+    return r.content.slice(0, 2000);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // PHASE 3: PLAN-AWARE VALIDATION
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Validates whether a result advances the current plan step */
+  private async validateForGoal(task: Task, result: string, ctx: StepContext, step: PlanStep): Promise<ValidationResult> {
+    const compressed = this.compressContext(ctx);
+    const r = await this.guardedChat(this.cfg.evalModel, [
+      { role: "system", content: 'You evaluate whether a task result advances a specific plan step toward a larger goal. Output ONLY valid JSON: {"pass":true/false,"confidence":0.0-1.0,"critique":"one sentence","suggestion":"...","advances_goal":true/false}' },
+      { role: "user", content: `Goal: ${ctx.goal}\nCurrent step: ${step.description}\nTask: ${task.name}\nResult:\n${result.slice(0, 600)}\n\nPrior progress:\n${compressed}` },
+    ]);
+
+    if (!r.ok) return { pass: true, confidence: 0.5, critique: "eval unavailable", suggestion: "" };
+
+    try {
+      const parsed = JSON.parse(r.content.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
+      return {
+        pass: Boolean(parsed.pass && parsed.advances_goal !== false),
+        confidence: Math.min(1, Math.max(0, Number(parsed.confidence) || 0.5)),
+        critique: String(parsed.critique ?? "").slice(0, 300),
+        suggestion: String(parsed.suggestion ?? "").slice(0, 300),
+      };
+    } catch {
+      return { pass: true, confidence: 0.5, critique: "parse error", suggestion: "" };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // PHASE 3: ADAPTIVE THRESHOLDS
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Returns validation threshold adjusted by historical success rate */
+  private adaptiveThreshold(): number {
+    if (!this.cfg.adaptiveThresholds) return 0.5;
+    const total = this._validationStats.passed + this._validationStats.failed;
+    if (total < 10) return 0.5; // not enough data
+    const successRate = this._validationStats.passed / total;
+    // If most tasks pass, we can afford to be stricter
+    // If most fail, loosen up to avoid blocking everything
+    return Math.min(0.8, Math.max(0.3, successRate * 0.7 + 0.15));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // PHASE 3: CONTEXT COMPRESSION
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Compress StepContext into a string that fits in 4k model context */
+  private compressContext(ctx: StepContext): string {
+    const lines: string[] = [
+      `Goal: ${ctx.goal.slice(0, 100)}`,
+      `Progress: ${ctx.stepIndex}/${ctx.totalSteps} steps`,
+    ];
+    if (ctx.completedSteps.length > 0) {
+      lines.push("Done: " + ctx.completedSteps.slice(-5).join(", "));
+    }
+    if (ctx.failedSteps.length > 0) {
+      lines.push("Failed: " + ctx.failedSteps.slice(-3).join(", "));
+    }
+    if (ctx.genomeFacts.length > 0) {
+      lines.push("Relevant knowledge: " + ctx.genomeFacts.slice(0, 3).join("; "));
+    }
+    const metrics = Object.entries(ctx.cumulativeMetrics)
+      .map(([k, v]) => `${k}=${typeof v === "number" ? v.toFixed(2) : v}`)
+      .join(", ");
+    if (metrics) lines.push(`Metrics: ${metrics}`);
+    return lines.join("\n").slice(0, 1500);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // PHASE 3: executeGoal() — THE FULL LOOP
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Decompose a goal into a plan, execute each step with inner loop,
+   * replan on failure, carry compressed state through.
+   */
+  async executeGoal(goal: string, context?: string): Promise<GoalResult> {
+    if (!this.planner) {
+      return { goalId: "", goal, planId: "", status: "aborted", stepsCompleted: 0, stepsTotal: 0, replans: 0, results: [], durationMs: 0 };
+    }
+
+    const startMs = Date.now();
+    const goalId = `g_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+    this.log.emit("goal_start", `${goalId}: ${goal.slice(0, 80)}`, { meta: { context: context?.slice(0, 200) } });
+
+    // Decompose goal into plan
+    const plan = await this.planner.decompose(goal, context);
+    this.log.emit("goal_step", `${goalId}: decomposed into ${plan.steps.length} steps`);
+
+    // Pull relevant genome facts for context
+    let genomeFacts: string[] = [];
+    try {
+      if (await this.autonomy.ping()) {
+        const keywords = goal.toLowerCase().split(/\s+/).filter((w) => w.length > 3).slice(0, 4).join(" ");
+        const { results } = await this.autonomy.searchFacts(keywords, 8);
+        if (results) genomeFacts = results.map((r) => r.content.slice(0, 100));
+      }
+    } catch { /* genome search is best-effort */ }
+
+    // Initialize StepContext
+    const ctx: StepContext = {
+      goalId,
+      goal,
+      planId: plan.id,
+      stepIndex: 0,
+      totalSteps: plan.steps.length,
+      completedSteps: [],
+      failedSteps: [],
+      cumulativeMetrics: {},
+      genomeFacts,
+      adaptedThreshold: this.adaptiveThreshold(),
+    };
+
+    const results: GoalResult["results"] = [];
+    let replans = 0;
+    let currentPlan = plan;
+
+    for (let i = 0; i < currentPlan.steps.length && i < this.cfg.maxGoalSteps; i++) {
+      const step = currentPlan.steps[i];
+      if (step.children && step.children.length > 0) continue; // skip parent steps
+      if (step.status === "completed" || step.status === "skipped") continue;
+
+      ctx.stepIndex = i;
+      this.log.emit("goal_step", `${goalId} step ${i}: ${step.description.slice(0, 80)}`);
+      this.planner.updateStep(currentPlan.id, step.id, { status: "in_progress" });
+
+      // Create and execute a task for this step
+      const task = this.tasks.add({
+        name: `[${goalId}] Step ${i}: ${step.description.slice(0, 50)}`,
+        description: step.description,
+        taskType: this.inferTaskType(step.description),
+        priority: 2,
+        tags: ["goal", goalId],
+      });
+
+      this.tasks.start(task.id);
+      const { result, exitCode } = await this.executeTask(task);
+
+      if (result === null) {
+        // Task blocked/failed at execution level
+        ctx.failedSteps.push(`step ${i}: execution blocked`);
+        results.push({ step: step.description, status: "blocked", result: task.error ?? "blocked" });
+        this.planner.updateStep(currentPlan.id, step.id, { status: "skipped", notes: "execution blocked" });
+        continue;
+      }
+
+      // Validate with plan awareness
+      const validation = await this.validateForGoal(task, result, ctx, step);
+      this.log.emit("goal_step", `${goalId} step ${i} validated: pass=${validation.pass} conf=${validation.confidence.toFixed(2)}`);
+
+      if (validation.pass) {
+        this.tasks.complete(task.id, result);
+        this.planner.updateStep(currentPlan.id, step.id, { status: "completed", notes: result.slice(0, 200) });
+        ctx.completedSteps.push(`step ${i}: ${step.description.slice(0, 30)} (${validation.confidence.toFixed(1)})`);
+        results.push({ step: step.description, status: "completed", result: result.slice(0, 300) });
+        await this.recordGenome(task, result, true);
+      } else {
+        // Step failed — try reformulation with genome
+        const newDesc = await this.reformulateWithGenome(task, validation.critique, validation.suggestion);
+
+        // Re-execute once with reformulated description
+        task.description = newDesc;
+        this.tasks.fail(task.id, `validation failed: ${validation.critique}`);
+
+        // Can we replan the remaining steps?
+        if (replans < this.cfg.maxGoalReplans) {
+          replans++;
+          this.log.emit("goal_replan", `${goalId}: replanning after step ${i} failure (replan ${replans}/${this.cfg.maxGoalReplans})`);
+
+          // Feed failure into planner for remaining steps
+          const remainingSteps = currentPlan.steps.slice(i + 1).filter((s) => s.status === "pending");
+          if (remainingSteps.length > 0 && this.planner) {
+            const replanContext = `Original goal: ${goal}\nCompleted: ${ctx.completedSteps.join("; ")}\nFailed at step ${i}: ${validation.critique}\nRemaining steps need adjustment.`;
+            const newPlan = await this.planner.decompose(
+              `Continue: ${goal} (after step ${i} failed: ${validation.critique})`,
+              replanContext,
+            );
+            // Replace remaining steps
+            for (const ns of newPlan.steps) {
+              currentPlan.steps.push({ ...ns, id: `replan${replans}_${ns.id}` });
+            }
+            this.log.emit("goal_replan", `${goalId}: added ${newPlan.steps.length} replanned steps`);
+          }
+        }
+
+        ctx.failedSteps.push(`step ${i}: ${validation.critique.slice(0, 50)}`);
+        results.push({ step: step.description, status: "failed", result: validation.critique });
+        this.planner.updateStep(currentPlan.id, step.id, { status: "skipped", notes: `failed: ${validation.critique.slice(0, 100)}` });
+        await this.recordGenome(task, result, false, validation.critique);
+      }
+    }
+
+    // Determine overall status
+    const completed = results.filter((r) => r.status === "completed").length;
+    const total = results.length;
+    const status: GoalResult["status"] =
+      completed === total && total > 0 ? "completed" :
+      completed > 0 ? "partial" :
+      "failed";
+
+    const durationMs = Date.now() - startMs;
+    this.log.emit("goal_complete", `${goalId}: ${status} (${completed}/${total} steps, ${replans} replans, ${durationMs}ms)`);
+
+    // Record goal outcome to genome
+    try {
+      if (await this.autonomy.ping()) {
+        await this.autonomy.record("system",
+          `[GOAL:${goalId}] "${goal.slice(0, 80)}" ${status}: ${completed}/${total} steps, ${replans} replans ∵ ${ctx.completedSteps.slice(-3).join("; ")}`,
+        );
+      }
+    } catch { /* best-effort */ }
+
+    return { goalId, goal, planId: plan.id, status, stepsCompleted: completed, stepsTotal: total, replans, results, durationMs };
+  }
+
+  /** Infer task type from step description */
+  private inferTaskType(desc: string): Task["taskType"] {
+    const lower = desc.toLowerCase();
+    if (lower.includes("run ") || lower.includes("execute") || lower.includes("install") || lower.includes("build")) return "shell";
+    if (lower.includes("research") || lower.includes("investigate") || lower.includes("find out")) return "research";
+    if (lower.includes("review") || lower.includes("compare") || lower.includes("evaluate")) return "delegate";
+    return "prompt";
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // TICK LOOP
+  // ═══════════════════════════════════════════════════════════════════
+
   async tick(): Promise<{ health: number; tasksProcessed: number; consolidated: boolean }> {
+    if (this._ticking) {
+      this.log.emit("daemon_tick", "tick skipped: previous tick still running");
+      return { health: 0, tasksProcessed: 0, consolidated: false };
+    }
+    this._ticking = true;
+    this._ollamaCallsThisTick = 0;
+    const tickStart = Date.now();
+
+    try {
+      return await this._tickInner(tickStart);
+    } finally {
+      this._ticking = false;
+    }
+  }
+
+  private async _tickInner(tickStart: number): Promise<{ health: number; tasksProcessed: number; consolidated: boolean }> {
     this.tickCount++;
     this.log.emit("daemon_tick", `tick #${this.tickCount} start`);
     let healthUp = 0;
     let tasksProcessed = 0;
     let consolidated = false;
 
-    // ── Health monitoring ────────────────────────────────
+    // Reset stale running tasks (>10 min)
+    for (const t of this.tasks.list({ status: "running" })) {
+      if (t.startedAt) {
+        const elapsed = Date.now() - new Date(t.startedAt).getTime();
+        if (elapsed > 600_000) {
+          this.tasks.fail(t.id, "stale: stuck running >10min, reset by daemon");
+          this.log.emit("inner_loop", `reset stale task ${t.id} (${t.name})`);
+        }
+      }
+    }
+
+    // Health monitoring
     if (this.cfg.healthMonitoring) {
       const statuses = await checkAllServices();
       for (const s of statuses) {
@@ -125,91 +622,71 @@ export class Daemon {
       }
     }
 
-    // ── Task processing ──────────────────────────────────
+    // Task processing with inner loop
     if (this.cfg.taskProcessing) {
       let processed = 0;
       while (processed < this.cfg.maxTasksPerTick) {
+        if (Date.now() - tickStart > this.cfg.tickTimeBudgetMs) {
+          this.log.emit("daemon_tick", `tick time budget exhausted`);
+          break;
+        }
+
         const task = this.tasks.next();
         if (!task) break;
         this.tasks.start(task.id);
         this.log.emit("task_event", `processing: ${task.name} (${task.taskType})`);
 
         try {
-          let result: string;
+          const { result, exitCode } = await this.executeTask(task);
 
-          if (task.taskType === "shell" && task.command) {
-            const exec = await shellExec(task.command, { timeoutMs: 60_000, log: this.log });
-            result = exec.exitCode === 0
-              ? exec.stdout || "OK"
-              : `EXIT ${exec.exitCode}: ${exec.stderr}`;
-            if (exec.exitCode !== 0 && !exec.timedOut) {
-              this.tasks.fail(task.id, result);
-              processed++;
-              continue;
-            }
-
-          } else if (task.taskType === "prompt" || task.taskType === "research") {
-            const systemPrompt = task.taskType === "research"
-              ? "You are a research assistant. Be thorough. Cite sources when possible."
-              : "You are a helpful assistant. Be concise and actionable.";
-            result = await this.ollama.chat(task.model ?? this.cfg.defaultModel, [
-              { role: "system", content: systemPrompt },
-              { role: "user", content: task.description },
-            ]);
-
-          } else if (task.taskType === "delegate") {
-            // Multi-model: get consensus from 2 models
-            const models = [this.cfg.defaultModel, "mistral:latest"];
-            const responses = await Promise.all(
-              models.map((m) => this.ollama.chat(m, [
-                { role: "user", content: task.description },
-              ])),
-            );
-            result = responses.map((r, i) => `[${models[i]}]: ${r}`).join("\n\n");
-
-          } else {
-            this.tasks.block(task.id, "Requires manual execution or unsupported task type");
+          if (result === null) {
             processed++;
             continue;
           }
 
-          this.tasks.complete(task.id, result);
-          this.log.emit("task_event", `completed: ${task.name}`);
+          // Phase 2: Use room validation for P1-P2 priority tasks
+          const isHighPriority = task.priority <= 2;
+          const validation = isHighPriority
+            ? await this.validateWithRoom(task, result)
+            : await this.validateResult(task, result, exitCode);
 
-          // Upgrade #1: Feed task outcome into genome as because-chain
-          try {
-            if (await this.autonomy.ping()) {
-              await this.autonomy.record("system",
-                `[TASK_RESULT:${task.id}] ${task.name} completed: ${result.slice(0, 500)} ∵ executed via ${task.taskType} on ${task.model ?? "shell"}`,
-              );
+          this.log.emit("inner_loop", `${task.id} validated: pass=${validation.pass} conf=${validation.confidence.toFixed(2)}${isHighPriority ? " [room]" : ""}${validation.critique ? ` "${validation.critique.slice(0, 60)}"` : ""}`);
+
+          if (validation.pass) {
+            this.tasks.complete(task.id, result);
+            this._replanCounts.delete(task.id);
+            this.log.emit("task_event", `completed: ${task.name}`);
+            await this.recordGenome(task, result, true);
+          } else {
+            // Phase 2: Genome-informed reformulation
+            const replanCount = this._replanCounts.get(task.id) ?? 0;
+            if (task.retryCount < task.maxRetries && replanCount === 0) {
+              this._replanCounts.set(task.id, replanCount + 1);
+              const newDesc = await this.reformulateWithGenome(task, validation.critique, validation.suggestion);
+              task.description = newDesc;
+              this.tasks.fail(task.id, `validation failed: ${validation.critique}`);
+            } else {
+              this.tasks.block(task.id, `validation failed after replan: ${validation.critique}`);
+              this.log.emit("inner_loop", `${task.id} blocked: replan limit reached`);
+              await this.recordGenome(task, result, false, validation.critique);
             }
-          } catch { /* genome recording is best-effort */ }
+          }
 
         } catch (err) {
           this.tasks.fail(task.id, String(err));
           this.log.emit("task_event", `failed: ${task.name}: ${err}`);
-
-          // Upgrade #1: Feed failure into genome so it doesn't repeat
-          try {
-            if (await this.autonomy.ping()) {
-              await this.autonomy.record("system",
-                `[TASK_FAILURE:${task.id}] ${task.name} failed: ${String(err).slice(0, 500)} ∵ ${task.retryCount}/${task.maxRetries} retries exhausted`,
-              );
-            }
-          } catch { /* genome recording is best-effort */ }
+          await this.recordGenome(task, String(err), false);
         }
         processed++;
       }
       tasksProcessed = processed;
     }
 
-    // ── Genome consolidation ────────────────────────────
-    // Upgrade #4: Sleep-time deep consolidation when idle > 5 min
-    const IDLE_THRESHOLD_MS = 300_000; // 5 minutes
+    // Genome consolidation
+    const IDLE_THRESHOLD_MS = 300_000;
     const isIdle = this.idleMs() > IDLE_THRESHOLD_MS;
 
     if (isIdle && !this._deepConsolidated) {
-      // Deep consolidation: topic-segmented, deduplication, contradiction resolution
       try {
         if (await this.autonomy.ping()) {
           await this.autonomy.consolidateDeep();
@@ -217,23 +694,111 @@ export class Daemon {
           this._deepConsolidated = true;
           this.log.emit("genome_event", "deep sleep-time consolidation (idle >5min)");
         }
-      } catch { /* silent */ }
+      } catch (e) { this.log.emit("error", `deep consolidation failed: ${e}`); }
     } else if (this.tickCount % this.cfg.consolidateEveryNTicks === 0) {
-      // Standard periodic consolidation
       try {
         if (await this.autonomy.ping()) {
           await this.autonomy.consolidate(true);
           consolidated = true;
           this.log.emit("genome_event", "genome consolidated (daemon periodic)");
         }
-      } catch { /* silent */ }
+      } catch (e) { this.log.emit("error", `periodic consolidation failed: ${e}`); }
     }
 
-    this.log.emit("daemon_tick", `tick #${this.tickCount} done: ${healthUp} healthy, ${tasksProcessed} tasks${consolidated ? ", consolidated" : ""}`);
+    this.log.emit("daemon_tick", `tick #${this.tickCount} done: ${healthUp} healthy, ${tasksProcessed} tasks, ${this._ollamaCallsThisTick} ollama calls${consolidated ? ", consolidated" : ""}`);
     return { health: healthUp, tasksProcessed, consolidated };
   }
 
-  status(): { running: boolean; tickCount: number; config: DaemonConfig } {
-    return { running: this.running, tickCount: this.tickCount, config: this.cfg };
+  // ═══════════════════════════════════════════════════════════════════
+  // TASK EXECUTION
+  // ═══════════════════════════════════════════════════════════════════
+
+  private async executeTask(task: Task): Promise<{ result: string | null; exitCode?: number }> {
+    if (task.taskType === "shell" && task.command) {
+      const blocked = isCommandBlocked(task.command);
+      if (blocked) {
+        this.tasks.block(task.id, `BLOCKED: denylist match "${blocked}"`);
+        this.log.emit("inner_loop", `${task.id} BLOCKED: denylist "${blocked}"`);
+        return { result: null };
+      }
+
+      const exec = await shellExec(task.command, { timeoutMs: 60_000, log: this.log });
+      const result = exec.exitCode === 0
+        ? exec.stdout || "OK"
+        : `EXIT ${exec.exitCode}: ${exec.stderr}`;
+
+      if (exec.exitCode !== 0 && !exec.timedOut) {
+        this.tasks.fail(task.id, result);
+        return { result: null };
+      }
+      return { result, exitCode: exec.exitCode };
+
+    } else if (task.taskType === "prompt" || task.taskType === "research") {
+      const systemPrompt = task.taskType === "research"
+        ? "You are a research assistant. Be thorough. Cite sources when possible."
+        : "You are a helpful assistant. Be concise and actionable.";
+      const r = await this.guardedChat(task.model ?? this.cfg.defaultModel, [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: task.description },
+      ]);
+      if (!r.ok) {
+        this.tasks.fail(task.id, `Ollama error: ${r.error}`);
+        return { result: null };
+      }
+      return { result: r.content };
+
+    } else if (task.taskType === "delegate") {
+      const models = this.cfg.roomValidationModels.length >= 2
+        ? this.cfg.roomValidationModels.slice(0, 2)
+        : [this.cfg.defaultModel];
+      const responses = await Promise.all(
+        models.map((m) => this.guardedChat(m, [
+          { role: "user", content: task.description },
+        ])),
+      );
+      const results = responses.map((r, i) =>
+        r.ok ? `[${models[i]}]: ${r.content}` : `[${models[i]}]: ERROR: ${r.error}`
+      );
+      return { result: results.join("\n\n") };
+
+    } else {
+      this.tasks.block(task.id, "Requires manual execution or unsupported task type");
+      return { result: null };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // GENOME RECORDING
+  // ═══════════════════════════════════════════════════════════════════
+
+  private async recordGenome(task: Task, result: string, success: boolean, critique?: string): Promise<void> {
+    try {
+      if (!(await this.autonomy.ping())) return;
+      const tag = success ? "TASK_RESULT" : "TASK_FAILURE";
+      const body = success
+        ? `[${tag}:${task.id}] ${task.name} completed: ${result.slice(0, 500)} ∵ executed via ${task.taskType} on ${task.model ?? "shell"}`
+        : `[${tag}:${task.id}] ${task.name} failed: ${result.slice(0, 300)}${critique ? ` ∵ ${critique}` : ""} ∵ ${task.retryCount}/${task.maxRetries} retries`;
+      await this.autonomy.record("system", body);
+    } catch (e) {
+      this.log.emit("error", `genome record failed: ${e}`);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // STATUS
+  // ═══════════════════════════════════════════════════════════════════
+
+  status(): {
+    running: boolean; tickCount: number; config: DaemonConfig;
+    ticking: boolean; ollamaCallsLastTick: number;
+    validationStats: typeof this._validationStats;
+    adaptiveThreshold: number;
+  } {
+    return {
+      running: this.running, tickCount: this.tickCount, config: this.cfg,
+      ticking: this._ticking, ollamaCallsLastTick: this._ollamaCallsThisTick,
+      validationStats: { ...this._validationStats },
+      adaptiveThreshold: this.adaptiveThreshold(),
+    };
   }
 }

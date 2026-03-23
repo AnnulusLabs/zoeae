@@ -1,5 +1,5 @@
 """
-Clawtonomy — Multi-Model Adversarial Room + Experiment Runner
+Zoeae — Multi-Model Adversarial Room + Experiment Runner
 OpenClaw / KERF — AnnulusLabs LLC — 2026-03-16
 
 Rooms: parallel, adversarial, round-robin, snowball
@@ -21,13 +21,13 @@ from typing import Dict, List, Optional, Tuple
 
 KERF_API      = os.environ.get('KERF_API', 'http://127.0.0.1:8767')
 OLLAMA_API    = os.environ.get('OLLAMA_API', 'http://127.0.0.1:11434')
-DATA_DIR      = Path(os.environ.get('CLAWTONOMY_DATA', 'A:/AI/KERF/.kerf'))
+DATA_DIR      = Path(os.environ.get('ZOEAE_DATA', 'A:/AI/KERF/.kerf'))
 ROOMS_DIR     = DATA_DIR / 'rooms'
 POSTMORTEM_DIR = DATA_DIR / 'postmortems'
 EXPERIMENT_DIR = DATA_DIR / 'experiments'
 PROVENANCE_LOG = DATA_DIR / 'provenance.jsonl'
 STATE_FILE    = DATA_DIR / 'session_state.json'
-LOCK_FILE     = Path(tempfile.gettempdir()) / 'clawtonomy.lock'
+LOCK_FILE     = Path(tempfile.gettempdir()) / 'zoeae.lock'
 BOOT_WINDOW   = 3600
 
 SERVICES = {

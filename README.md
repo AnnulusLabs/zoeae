@@ -1,4 +1,4 @@
-# Clawtonomy — Persistent Cognitive Genome for OpenClaw
+# Zoeae — Persistent Cognitive Genome for OpenClaw
 
 Bridges AUTONOMY v3.0 into OpenClaw as a stock extension.
 
@@ -37,7 +37,7 @@ openclaw genome ccm 1MUC 3NJP 1YY9 4ZUL
 ## Architecture
 
 ```
-OpenClaw <-> Clawtonomy (TS) <-> AUTONOMY v3.0 (Python, :8766)
+OpenClaw <-> Zoeae (TS) <-> AUTONOMY v3.0 (Python, :8766)
                                    ├─ Genome Engine (SQLite+CRDT)
                                    ├─ StressCompiler (4 tiers)
                                    ├─ Daemon (bridge/entropy/compact)

@@ -1,7 +1,8 @@
 {
-  "id": "clawtonomy",
-  "name": "Clawtonomy",
-  "description": "Autonomous cognitive agent — genome memory, shell execution, file I/O, task queue, multi-model rooms (7 modes incl. sparse-debate, Free-MAD, vote), goal planning, service monitoring, background daemon, real-time activity logging. No holds barred.",
+  "id": "zoeae",
+  "name": "Zoeae",
+  "version": "0.5.0",
+  "description": "Living orchestration runtime — 7-channel antenna perception, developmental bleed, ecosystem orchestration (Courtyard, ToeBuster, FabNet, SensorNet, PatentGen, MeshNode), multi-model rooms, genome memory, autonomous daemon.",
   "kind": "tool",
   "configSchema": {
     "type": "object",
@@ -101,16 +102,6 @@
         "type": "number",
         "default": 8768,
         "description": "MCP server port"
-      },
-      "dashboardEnabled": {
-        "type": "boolean",
-        "default": false,
-        "description": "Start telemetry dashboard on gateway startup (port 8769)"
-      },
-      "dashboardPort": {
-        "type": "number",
-        "default": 8769,
-        "description": "Telemetry dashboard port"
       }
     }
   }

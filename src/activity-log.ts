@@ -27,7 +27,17 @@ export type ActivityKind =
   | "plan_event"     // plan created/updated
   | "genome_event"   // genome consolidate/boot/record
   | "error"          // something went wrong
-  | "info";          // general info
+  | "info"           // general info
+  // Phase 1+2 inner loop kinds
+  | "inner_loop"     // validation gate result
+  | "inner_replan"   // reformulation/replan event
+  | "inner_room"     // room-backed multi-model validation
+  | "inner_genome"   // genome-informed reformulation
+  // Phase 3 goal execution kinds
+  | "goal_start"     // executeGoal() initiated
+  | "goal_step"      // goal step execution
+  | "goal_replan"    // goal-level replanning
+  | "goal_complete"; // executeGoal() finished
 
 export type ActivityEntry = {
   ts: string;

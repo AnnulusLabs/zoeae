@@ -1,0 +1,310 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# OpenClaw Plugin Capability Manifest
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Version:  0.1.0
+# Plugin:   @openclaw/zoeae
+# Author:   AnnulusLabs LLC
+# Date:     2026-03-17
+#
+# THIS IS A CAPABILITY DECLARATION, NOT A SECURITY ENFORCEMENT MECHANISM.
+#
+# Think of it like Android's AndroidManifest.xml: it declares what the plugin
+# needs, what it's allowed to do, and under what constraints. Two layers can
+# read and enforce it independently:
+#
+#   1. IN-PROCESS (Zoeae daemon) — checks before tool dispatch
+#   2. INFRASTRUCTURE (NemoClaw)  — kernel-level sandbox (Landlock, seccomp)
+#
+# The tool policy matrix (Section 3) IS enforceable in-process because Zoeae
+# controls tool dispatch. Everything else is a declared contract.
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+spec_version: "0.1.0"
+
+plugin:
+  id: "zoeae"
+  name: "Zoeae"
+  version: "3.0.0"
+  publisher: "annuluslabs"
+  capabilities:
+    - "shell"               # Spawns OS subprocesses
+    - "filesystem"          # Reads/writes files
+    - "network_localhost"   # Connects to localhost services (Ollama, AUTONOMY)
+    - "network_listen"      # Binds MCP server on localhost:8768
+    - "daemon"              # Runs background autonomous loop
+    - "inference"           # Invokes local LLM models via Ollama
+    - "genome"              # Reads/writes persistent memory
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. PROCESS POLICY
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Maps 1:1 to COMMAND_DENYLIST in daemon.ts and shellExec() in executor.ts.
+# The denylist is substring-match theater — it won't stop `find / -delete` or
+# base64-encoded commands. For high-security: uncomment the allowlist.
+#
+process:
+  spawn_allowed: true
+
+  command_denylist:
+    - pattern: "rm -rf /"
+      reason: "Recursive root deletion"
+    - pattern: "rm -rf ~"
+      reason: "Recursive home deletion"
+    - pattern: "rm -rf ."
+      reason: "Recursive cwd deletion"
+    - pattern: "dd if="
+      reason: "Raw disk read"
+    - pattern: "dd of="
+      reason: "Raw disk write"
+    - pattern: "mkfs"
+      reason: "Filesystem format"
+    - pattern: "diskpart"
+      reason: "Windows disk partition tool"
+    - pattern: ":(){"
+      reason: "Fork bomb"
+    - pattern: "chmod -R 777 /"
+      reason: "Global permission strip"
+    - pattern: "Clear-Disk"
+      reason: "Windows disk wipe"
+    - pattern: "Disable-PnpDevice"
+      reason: "Hardware device disable"
+    - pattern: "Format-Volume"
+      reason: "Windows volume format"
+    - pattern: "> /dev/sda"
+      reason: "Direct disk write"
+    - pattern: "shutdown"
+      reason: "System shutdown"
+    - pattern: "reboot"
+      reason: "System reboot"
+    - pattern: "init 0"
+      reason: "System halt"
+    - pattern: "init 6"
+      reason: "System reboot (init)"
+
+  # Uncomment for high-security deployments (allowlist mode):
+  # command_allowlist:
+  #   - "git"
+  #   - "npm"
+  #   - "node"
+  #   - "python"
+  #   - "pip"
+  #   - "make"
+  #   - "ls"
+  #   - "cat"
+  #   - "grep"
+  #   - "ollama"
+
+  default_timeout_ms: 30000
+  daemon_timeout_ms: 60000
+  max_concurrent: 3
+  max_stdout_bytes: 2097152   # 2 MB
+  allowed_shells:
+    - "/bin/bash"
+    - "/bin/sh"
+    - "powershell.exe"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. INFERENCE POLICY
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Maps to guardedChat() call cap and tick time budget in daemon.ts.
+#
+inference:
+  allowed_models:
+    - "hermes3:*"
+    - "phi4-mini-reasoning"
+    - "smollm3:*"
+    - "mistral:*"
+    - "deepseek-r1:*"
+    - "llama3*"
+    - "qwen*"
+    - "devstral*"
+    - "glm*"
+
+  max_calls_per_tick: 10          # daemon.ts: maxOllamaCallsPerTick
+  max_calls_per_session: 500
+  tick_time_budget_ms: 120000     # daemon.ts: tickTimeBudgetMs
+  rate_limit_per_minute: 30
+
+  room:
+    max_models_per_query: 5
+    validation_threshold: 0.6
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. TOOL POLICY MATRIX
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Per-tool execution permissions by context. THIS IS ENFORCEABLE IN-PROCESS
+# because Zoeae controls tool dispatch and knows the execution context.
+#
+# Contexts:
+#   interactive — User present, initiated the call
+#   daemon      — Background autonomous tick (no user)
+#   goal        — Autonomous goal execution via executeGoal()
+#   mcp         — External MCP client invocation
+#
+# Permissions:
+#   allow        — Execute without restriction
+#   allow_logged — Execute + emit audit log entry
+#   confirm      — Require human confirmation
+#   deny         — Block entirely
+#
+tool_policy:
+  # High-risk: direct OS access
+  shell:
+    interactive: "allow_logged"
+    daemon: "allow_logged"
+    goal: "allow_logged"
+    mcp: "confirm"
+
+  file:
+    interactive: "allow_logged"
+    daemon: "allow_logged"
+    goal: "allow_logged"
+    mcp: "confirm"
+    actions:
+      delete:
+        daemon: "confirm"
+        mcp: "deny"
+
+  # Medium-risk: drives autonomous execution
+  task:
+    interactive: "allow"
+    daemon: "allow"
+    goal: "allow"
+    mcp: "allow_logged"
+
+  plan:
+    interactive: "allow"
+    daemon: "allow"
+    goal: "allow"
+    mcp: "allow_logged"
+
+  delegate:
+    interactive: "allow_logged"
+    daemon: "allow_logged"
+    goal: "allow_logged"
+    mcp: "allow_logged"
+
+  # High-risk: process control
+  services:
+    interactive: "allow_logged"
+    daemon: "allow_logged"
+    goal: "confirm"
+    mcp: "deny"
+
+  daemon:
+    interactive: "allow"
+    daemon: "deny"          # Cannot control itself
+    goal: "deny"
+    mcp: "confirm"
+
+  # Low-risk: persistent memory
+  genome_search:
+    interactive: "allow"
+    daemon: "allow"
+    goal: "allow"
+    mcp: "allow_logged"
+
+  genome_stats:
+    interactive: "allow"
+    daemon: "allow"
+    goal: "allow"
+    mcp: "allow"
+
+  genome_ccm:
+    interactive: "allow"
+    daemon: "allow_logged"
+    goal: "allow_logged"
+    mcp: "allow_logged"
+
+  genome_sync:
+    interactive: "allow_logged"
+    daemon: "deny"          # No autonomous cross-device sync
+    goal: "deny"
+    mcp: "confirm"
+
+  # Medium-risk: multi-model budget
+  room_query:
+    interactive: "allow_logged"
+    daemon: "allow_logged"
+    goal: "allow_logged"
+    mcp: "allow_logged"
+
+  room_manage:
+    interactive: "allow"
+    daemon: "deny"          # Cannot reconfigure room autonomously
+    goal: "deny"
+    mcp: "confirm"
+
+  # Low-risk: observability
+  activity:
+    interactive: "allow"
+    daemon: "allow"
+    goal: "allow"
+    mcp: "allow"
+
+  reflect:
+    interactive: "allow"
+    daemon: "allow_logged"
+    goal: "allow_logged"
+    mcp: "allow_logged"
+
+  # High-risk: top-level autonomous primitive
+  goal:
+    interactive: "allow_logged"
+    daemon: "deny"          # Tick loop does NOT auto-invoke goals
+    goal: "deny"            # No recursive goal invocation
+    mcp: "confirm"
+
+  # Self-control
+  mcp:
+    interactive: "allow"
+    daemon: "deny"
+    goal: "deny"
+    mcp: "deny"             # Cannot control its own server
+
+  dashboard:
+    interactive: "allow"
+    daemon: "allow"
+    goal: "allow"
+    mcp: "allow"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. ESCALATION POLICY
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+escalation:
+  on_violation:
+    warning:
+      action: "log"
+      continue_execution: true
+
+    blocked:
+      action: "block_and_log"
+      notify_user: true
+      continue_execution: false
+      record_to_genome: true
+
+    critical:
+      action: "block_log_and_halt"
+      notify_user: true
+      halt_daemon: true
+      cooldown_ms: 300000   # 5 min before daemon can restart
+
+  repeat_detection:
+    window_ms: 60000
+    max_violations_before_escalate: 3
+    chain: ["warning", "blocked", "critical"]
+
+  degradation:
+    on_inference_budget_exhausted: "skip_validation"
+    on_time_budget_exhausted: "pause_until_next_tick"
+    on_network_unreachable: "offline_mode"

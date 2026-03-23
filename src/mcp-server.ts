@@ -1,5 +1,5 @@
 /**
- * MCP Server — Model Context Protocol interface for Clawtonomy
+ * MCP Server — Model Context Protocol interface for Zoeae
  *
  * Exposes all tools + resources via MCP so ANY client can use them:
  * Claude Code, Cursor, Windsurf, custom agents, anything that speaks MCP.
@@ -148,7 +148,7 @@ export class McpServer {
         return {
           protocolVersion: "2024-11-05",
           capabilities: { tools: {}, resources: {} },
-          serverInfo: { name: "clawtonomy", version: "2026.3.16" },
+          serverInfo: { name: "zoeae", version: "2026.3.16" },
         };
 
       case "tools/list":
