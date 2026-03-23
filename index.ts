@@ -375,9 +375,10 @@ const zoeae = {
         }
       } catch { /* silent */ }
 
-      // Auto-start daemon
+      // Auto-start daemon + dream engine
       if (getCfg().daemonAutoStart) {
         getDaemon().start();
+        getDaemon().enableDreaming();
       }
 
       // Upgrade #5: Start MCP server
@@ -1123,6 +1124,91 @@ const zoeae = {
         },
       }),
       { names: ["goal"] },
+    );
+
+    // ═══════════════════════════════════════════════════════
+    // TOOLS — Dream Engine
+    // ═══════════════════════════════════════════════════════
+
+    api.registerTool(
+      () => ({
+        name: "dream",
+        description:
+          "Control the dream engine — creative recombination of unrelated genome facts " +
+          "during idle time. Finds analogical bridges across domains that nobody asked for. " +
+          "Actions: start, stop, status, once (trigger one dream now), history, bridges (kept dreams only).",
+        parameters: {
+          type: "object" as const,
+          properties: {
+            action: { type: "string", description: "start|stop|status|once|history|bridges" },
+          },
+          required: ["action"],
+        },
+        async execute(args: { action: string }) {
+          const daemon = getDaemon();
+          switch (args.action) {
+            case "start": {
+              const dreamer = daemon.enableDreaming();
+              return { content: `Dream engine started. Will dream when idle >${dreamer.status().config.minIdleMs / 60000}min.` };
+            }
+            case "stop": {
+              const d = daemon.getDreamer();
+              if (!d) return { content: "Dream engine not initialized." };
+              d.stop();
+              return { content: `Dream engine stopped. ${d.status().keptCount} bridges found.` };
+            }
+            case "status": {
+              const d = daemon.getDreamer();
+              if (!d) return { content: "Dream engine not initialized. Use action=start." };
+              const s = d.status();
+              return { content: `Dreams: ${s.dreamCount} total, ${s.keptCount} kept (avg quality ${s.avgQuality.toFixed(2)})\nRunning: ${s.running}\nModel: ${s.config.model}\nIdle threshold: ${s.config.minIdleMs / 60000}min` };
+            }
+            case "once": {
+              const dreamer = daemon.getDreamer() ?? daemon.enableDreaming();
+              getLog().emit("info", "manual dream triggered");
+              const dream = await dreamer.dreamOnce();
+              if (!dream) return { content: "Dream produced nothing (not enough facts or no connection found)." };
+              return {
+                content: [
+                  `Dream: ${dream.id}`,
+                  `Domains: [${dream.domains.join(" ↔ ")}]`,
+                  `Quality: ${dream.quality.toFixed(2)} ${dream.kept ? "KEPT" : "discarded"}`,
+                  "",
+                  `Facts:`,
+                  ...dream.facts.map((f, i) => `  ${i + 1}. ${f.slice(0, 120)}`),
+                  "",
+                  `Bridge: ${dream.bridge}`,
+                ].join("\n"),
+              };
+            }
+            case "history": {
+              const d = daemon.getDreamer();
+              if (!d) return { content: "No dreams yet." };
+              const dreams = d.history(10);
+              if (dreams.length === 0) return { content: "No dreams yet." };
+              return {
+                content: dreams.map((dr) =>
+                  `${dr.ts.slice(0, 19)} [${dr.domains.join("↔")}] q=${dr.quality.toFixed(2)}${dr.kept ? " KEPT" : ""}: ${dr.bridge.slice(0, 80)}`
+                ).join("\n"),
+              };
+            }
+            case "bridges": {
+              const d = daemon.getDreamer();
+              if (!d) return { content: "No dreams yet." };
+              const bridges = d.bridges();
+              if (bridges.length === 0) return { content: "No bridges found yet. Dreams need time." };
+              return {
+                content: bridges.map((dr) =>
+                  `[${dr.domains.join(" ↔ ")}] (q=${dr.quality.toFixed(2)})\n  ${dr.bridge}`
+                ).join("\n\n"),
+              };
+            }
+            default:
+              return { content: `Unknown action: ${args.action}. Use: start, stop, status, once, history, bridges` };
+          }
+        },
+      }),
+      { names: ["dream"] },
     );
 
     // ═══════════════════════════════════════════════════════

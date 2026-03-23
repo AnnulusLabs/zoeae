@@ -19,6 +19,7 @@ import { shellExec } from "./executor.js";
 import { OllamaClient, type ChatResult } from "./ollama-client.js";
 import { AutonomyClient } from "./autonomy-client.js";
 import { ActivityLog } from "./activity-log.js";
+import { DreamEngine, type DreamConfig } from "./dream-engine.js";
 import { join } from "node:path";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -137,6 +138,7 @@ export class Daemon {
   private cfg: DaemonConfig;
   private tasks: TaskEngine;
   private planner: Planner | null = null;
+  private dreamer: DreamEngine | null = null;
   private ollama: OllamaClient;
   private autonomy: AutonomyClient;
   private log: ActivityLog;
@@ -168,6 +170,21 @@ export class Daemon {
     this.planner = planner;
   }
 
+  /** Initialize and start dream engine */
+  enableDreaming(config?: Partial<DreamConfig>): DreamEngine {
+    if (!this.dreamer) {
+      this.dreamer = new DreamEngine(
+        this.ollama, this.log,
+        () => this.idleMs(),
+        config,
+      );
+    }
+    this.dreamer.start();
+    return this.dreamer;
+  }
+
+  getDreamer(): DreamEngine | null { return this.dreamer; }
+
   start(): boolean {
     if (this.running) return false;
     this.running = true;
@@ -184,6 +201,7 @@ export class Daemon {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.running = false;
+    if (this.dreamer) this.dreamer.stop();
     this.log.emit("daemon_tick", "daemon stopped");
     return true;
   }
