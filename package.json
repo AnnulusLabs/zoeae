@@ -1,7 +1,7 @@
 {
   "name": "@openclaw/zoeae",
   "version": "0.6.0",
-  "description": "Autonomous cognitive agent for OpenClaw — genome memory, shell execution, task queue, multi-model rooms, planning, service monitoring, background daemon",
+  "description": "Living orchestration runtime — Rust core, TypeScript OpenClaw plugin, Python framework",
   "type": "module",
   "author": "AnnulusLabs LLC <steve@annuluslabs.com>",
   "license": "MIT",
@@ -15,7 +15,7 @@
   },
   "openclaw": {
     "extensions": [
-      "./index.ts"
+      "./ts/index.ts"
     ]
   }
 }
