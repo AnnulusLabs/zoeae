@@ -33,6 +33,8 @@ import { McpServer } from "./src/mcp-server.js";
 import { renderDashboard } from "./src/dashboard.js";
 import { PolicyEngine } from "./src/policy.js";
 import { AgentPool, type AgentConfig } from "./src/agent-pool.js";
+import { K1CBridge, buildK1CTools } from "./src/k1c-bridge.js";
+import { registerAllEcosystemTools } from "./src/ecosystem-tools.js";
 import { join } from "node:path";
 
 // ═══════════════════════════════════════════════════════════════
@@ -131,6 +133,7 @@ const zoeae = {
     let _planner: Planner | null = null;
     let _daemon: Daemon | null = null;
     let _pool: AgentPool | null = null;
+    let _k1c: K1CBridge | null = null;
     let _log: ActivityLog | null = null;
     let _mcp: McpServer | null = null;
     let _policy: PolicyEngine | null = null;
@@ -1402,6 +1405,21 @@ const zoeae = {
       }),
       { names: ["pool"] },
     );
+
+    // ═══════════════════════════════════════════════════════
+    // TOOLS — K1C 3D Printer + Ecosystem (Maker Organs)
+    // ═══════════════════════════════════════════════════════
+
+    // K1C Moonraker bridge
+    if (!_k1c) _k1c = new K1CBridge(getLog());
+    for (const tool of buildK1CTools(_k1c)) {
+      api.registerTool(() => tool, { names: [tool.name] });
+    }
+
+    // Ecosystem tools (courtyard, fabnet, sensornet, toebuster, patentgen, meshnode, maker)
+    for (const tool of registerAllEcosystemTools({ ollama: getOllama(), log: getLog(), policy: getPolicy() })) {
+      api.registerTool(() => tool, { names: [tool.name] });
+    }
 
     // ═══════════════════════════════════════════════════════
     // TOOLS — Cross-Device Sync (Upgrade #7)
