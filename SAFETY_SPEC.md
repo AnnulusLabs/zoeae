@@ -1,4 +1,10 @@
-# OpenClaw Plugin Safety Policy Specification v1.0.0
+# OpenClaw Plugin Safety Policy Specification v1.1.0
+
+> **v1.1.0 (2026-03-23):** PolicyEngine (`src/policy.ts`) now enforces safety.yaml
+> in-process. Hardcoded `COMMAND_DENYLIST` and `isCommandBlocked()` removed from
+> daemon.ts. All 17 tools gated by `policy.checkTool()`. Filesystem operations
+> gated by `policy.checkPathRead()`/`checkPathWrite()`. Model allowlist and
+> inference budget enforced in `guardedChat()`. Service restart rate limiting active.
 
 ## Enforcement Mapping Table
 
@@ -33,8 +39,8 @@ the hard floor; in-process enforcement is the fast path.
 | safety.yaml field | Zoeae In-Process Enforcement | NemoClaw Infrastructure Enforcement |
 |---|---|---|
 | `process.spawn_allowed` | Gate in `shellExec()` — if false, return error immediately | seccomp filter: deny `execve(2)` entirely |
-| `process.command_denylist[*].pattern` | `isCommandBlocked()` in `daemon.ts` lines 78-91 — substring match, case-insensitive | seccomp cannot inspect execve arguments; this is in-process only. NemoClaw compensates with Landlock path restrictions on destructive targets. |
-| `process.command_allowlist` | (Optional) Prefix-match allowlist in `shellExec()` | seccomp allowlist on `execve(2)` binary paths |
+| `process.command_denylist[*].pattern` | `PolicyEngine.checkCommand()` in `policy.ts` — **regex match**, case-insensitive (upgraded from substring match in v1.1.0) | seccomp cannot inspect execve arguments; this is in-process only. NemoClaw compensates with Landlock path restrictions on destructive targets. |
+| `process.command_allowlist` | `PolicyEngine.checkCommand()` — when allowlist is present, only listed command prefixes are permitted (takes precedence over denylist) | seccomp allowlist on `execve(2)` binary paths |
 | `process.default_timeout_ms` | `shellExec()` `timeoutMs` parameter (default 30s) in `executor.ts` line 40 | `RLIMIT_CPU` per-process via `prlimit(2)` in pid namespace |
 | `process.daemon_timeout_ms` | `executeTask()` override: 60s timeout in `daemon.ts` line 722 | Same as above, longer limit for daemon context |
 | `process.max_concurrent` | Semaphore around `shellExec()` calls | pid namespace `pid.max` cgroup controller |
@@ -59,11 +65,11 @@ the hard floor; in-process enforcement is the fast path.
 
 | safety.yaml field | Zoeae In-Process Enforcement | NemoClaw Infrastructure Enforcement |
 |---|---|---|
-| `tool_policy.<tool>.<context>` | Context-aware wrapper around each `api.registerTool()` handler: checks execution mode before dispatch | NemoClaw cannot distinguish tool-level dispatch. Enforcement is through the underlying syscalls each tool triggers (e.g., `shell` tool triggers `execve`, `file` tool triggers `open/write`). |
+| `tool_policy.<tool>.<context>` | `PolicyEngine.checkTool()` called at top of every tool's `execute()` handler in `index.ts`. All 17 tools gated as of v1.1.0. | NemoClaw cannot distinguish tool-level dispatch. Enforcement is through the underlying syscalls each tool triggers (e.g., `shell` tool triggers `execve`, `file` tool triggers `open/write`). |
 | `"allow"` | Execute, no logging overhead | No additional restriction |
-| `"allow_logged"` | Execute + `ActivityLog.emit("tool_invocation", ...)` | Kernel audit subsystem logs syscall |
-| `"confirm"` | Emit confirmation request to user via `api.requestConfirmation()`, block until approved | NemoClaw: action queued in sandbox control plane; user approval gate in orchestrator |
-| `"deny"` | Return error immediately, never reach tool handler | Underlying syscalls denied by Landlock/seccomp rules for that context |
+| `"allow_logged"` | Execute + `ActivityLog.emit("tool_invocation", ...)` via `PolicyEngine.permissionToVerdict()` | Kernel audit subsystem logs syscall |
+| `"confirm"` | In autonomous contexts (`daemon`/`goal`), treated as `deny` (no human present). In `interactive`/`mcp`, returns advisory. | NemoClaw: action queued in sandbox control plane; user approval gate in orchestrator |
+| `"deny"` | Return `POLICY BLOCKED` error immediately, never reach tool handler | Underlying syscalls denied by Landlock/seccomp rules for that context |
 
 ### 6. Escalation Policy
 
@@ -93,27 +99,34 @@ the hard floor; in-process enforcement is the fast path.
 
 ---
 
-## Zoeae Existing Safeguard Inventory
+## Zoeae Safeguard Inventory (v1.1.0)
 
 Cross-reference of every safeguard currently implemented in Zoeae and where it
-appears in `safety.yaml`:
+appears in `safety.yaml`. **All enforcement routes through `PolicyEngine` (`src/policy.ts`)
+as of v1.1.0.**
 
 | Safeguard | Source Location | safety.yaml Section |
 |---|---|---|
-| Command denylist (16 patterns) | `daemon.ts` lines 78-83, `isCommandBlocked()` | `process.command_denylist` |
-| Ollama call cap per tick (10) | `daemon.ts` line 39, `guardedChat()` line 206 | `inference.max_calls_per_tick` |
-| Tick mutex (no concurrent ticks) | `daemon.ts` `_ticking` flag, line 576 | Implicit in `resources.daemon` (structural, not configurable) |
-| Exit-code-is-truth | `daemon.ts` `validateResult()` line 218 | `inference.room.validation_threshold` (validation semantics) |
-| Replan depth limit (1 replan) | `daemon.ts` line 660 `_replanCount` | `resources.daemon.max_goal_replans` |
-| Goal step cap (20) | `daemon.ts` line 464 | `resources.daemon.max_goal_steps` |
-| Goal replan cap (2) | `daemon.ts` line 512 | `resources.daemon.max_goal_replans` |
-| Tick time budget (120s) | `daemon.ts` line 628 | `resources.daemon.tick_time_budget_ms` |
-| Shell timeout (30s default, 60s daemon) | `executor.ts` line 40, `daemon.ts` line 722 | `process.default_timeout_ms`, `process.daemon_timeout_ms` |
-| Stdout buffer cap (2MB) | `executor.ts` line 52 | `process.max_stdout_bytes` |
-| Stale task reset (10 min) | `daemon.ts` lines 599-607 | `resources.daemon.stale_task_timeout_ms` |
-| Max tasks per tick (3) | `daemon.ts` line 627 | `resources.daemon.max_tasks_per_tick` |
-| Room validation threshold (0.6) | `daemon.ts` line 43 | `inference.room.validation_threshold` |
-| Adaptive validation thresholds | `daemon.ts` `adaptiveThreshold()` line 379 | `inference.room.validation_threshold` (base; adaptive adjustment is in-process logic) |
+| Command denylist (16 regex patterns) | `policy.ts` `checkCommand()` → `daemon.ts` `executeTask()` + `executor.ts` `shellExec()` | `process.command_denylist` |
+| Command allowlist (optional) | `policy.ts` `checkCommand()` — prefix-match, takes precedence over denylist | `process.command_allowlist` |
+| Filesystem path gating | `policy.ts` `checkPathRead()`/`checkPathWrite()` → `executor.ts` `readFile`/`writeFile`/`appendToFile`/`deleteFile` | `filesystem.*` (hardcoded in policy.ts, will read from yaml when NemoClaw stabilizes) |
+| Tool policy matrix (17 tools) | `policy.ts` `checkTool()` → every tool's `execute()` in `index.ts` + `daemon.ts` `executeTask()` | `tool_policy.*` |
+| Model allowlist (glob patterns) | `policy.ts` `checkModel()` → `daemon.ts` `guardedChat()` | `inference.allowed_models` |
+| Session inference budget | `policy.ts` `checkInferenceBudget()` → `daemon.ts` `guardedChat()` | `inference.max_calls_per_session` |
+| Service restart rate limiting | `policy.ts` `checkServiceRestart()` → `daemon.ts` `_tickInner()` + `services.ts` `restartService()` | `escalation.repeat_detection` (window-based) |
+| Violation escalation chain | `policy.ts` `recordViolation()` — warning → blocked → critical | `escalation.repeat_detection.chain` |
+| Ollama call cap per tick (10) | `daemon.ts` `guardedChat()`, budget from `policy.getBudgets()` | `inference.max_calls_per_tick` |
+| Tick mutex (no concurrent ticks) | `daemon.ts` `_ticking` flag | Structural, not configurable |
+| Exit-code-is-truth | `daemon.ts` `validateResult()` | Validation semantics |
+| Goal step cap (20) | `daemon.ts`, budget from `policy.getBudgets()` | `resources.daemon.max_goal_steps` |
+| Goal replan cap (2) | `daemon.ts`, budget from `policy.getBudgets()` | `resources.daemon.max_goal_replans` |
+| Tick time budget (120s) | `daemon.ts`, budget from `policy.getBudgets()` | `inference.tick_time_budget_ms` |
+| Shell timeout (30s default, 60s daemon) | `executor.ts`, budget from `policy.getBudgets()` | `process.default_timeout_ms`, `process.daemon_timeout_ms` |
+| Stdout buffer cap (2MB) | `executor.ts` `nodeExec()` | `process.max_stdout_bytes` |
+| Stale task reset (10 min) | `daemon.ts` `_tickInner()` | Hardcoded 600s |
+| Room validation threshold (0.6) | `daemon.ts`, budget from `policy.getBudgets()` | `inference.room.validation_threshold` |
+| Adaptive validation thresholds | `daemon.ts` `adaptiveThreshold()` | In-process logic, not configurable via policy |
+| Dashboard policy stats | `dashboard.ts` POLICY section — violations, warnings, blocks, tool audit | Aggregated from activity.jsonl `policy_*` events |
 
 ---
 

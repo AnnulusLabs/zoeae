@@ -10,6 +10,7 @@
 
 import { shellExec } from "./executor.js";
 import type { ActivityLog } from "./activity-log.js";
+import type { PolicyEngine } from "./policy.js";
 
 export type ServiceStatus = {
   name: string;
@@ -74,11 +75,20 @@ export async function checkAllServices(extra?: ServiceDef[]): Promise<ServiceSta
   return Promise.all(all.map((s) => checkOne(s)));
 }
 
-export async function restartService(name: string, log?: ActivityLog, extra?: ServiceDef[]): Promise<string> {
+export async function restartService(name: string, log?: ActivityLog, extra?: ServiceDef[], policy?: PolicyEngine): Promise<string> {
   const all = [...BUILTIN_SERVICES, ...(extra ?? [])];
   const svc = all.find((s) => s.name === name);
   if (!svc) return `Unknown service: ${name}. Known: ${all.map((s) => s.name).join(", ")}`;
   if (!svc.startCommand) return `No start command configured for ${name}`;
+
+  // Policy: check restart rate limit
+  if (policy) {
+    const v = policy.checkServiceRestart(name);
+    if (!v.allowed) {
+      log?.emit("policy_violation", `restart blocked: ${v.reason}`);
+      return `POLICY BLOCKED: ${v.reason}`;
+    }
+  }
 
   log?.emit("service_check", `restarting ${name}...`);
   const result = await shellExec(svc.startCommand, { timeoutMs: 15_000, log });

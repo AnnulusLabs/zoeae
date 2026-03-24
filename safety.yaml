@@ -276,6 +276,17 @@ tool_policy:
     goal: "allow"
     mcp: "allow"
 
+  # Creative recombination engine
+  dream:
+    interactive: "allow"
+    daemon: "allow"          # Dreams happen during daemon idle time
+    goal: "deny"             # Goals don't dream
+    mcp: "allow_logged"
+    budget:
+      max_per_session: 50
+      max_per_tick: 2         # Don't starve task processing for Ollama bandwidth
+      max_promoted_per_session: 10  # Cap auto-generated research tasks
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 4. ESCALATION POLICY

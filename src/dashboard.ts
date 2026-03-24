@@ -43,6 +43,7 @@ type AggregatedStats = {
   taskStats: { completed: number; failed: number; blocked: number };
   roomModeUsage: Record<string, number>;
   serviceHealth: Record<string, { checks: number; failures: number; uptime: string }>;
+  policyStats: { violations: number; warnings: number; blocks: number; toolInvocations: number; recentViolations: string[] };
   recentEntries: Array<{ ts: string; kind: string; summary: string; durationMs?: number }>;
   timeRange: { first: string; last: string };
 };
@@ -56,6 +57,7 @@ function aggregate(logPath: string): AggregatedStats {
     taskStats: { completed: 0, failed: 0, blocked: 0 },
     roomModeUsage: {},
     serviceHealth: {},
+    policyStats: { violations: 0, warnings: 0, blocks: 0, toolInvocations: 0, recentViolations: [] },
     recentEntries: [],
     timeRange: { first: "", last: "" },
   };
@@ -103,6 +105,25 @@ function aggregate(logPath: string): AggregatedStats {
         stats.serviceHealth[name].checks++;
         if (e.summary.includes("DOWN")) stats.serviceHealth[name].failures++;
       }
+    }
+
+    if (e.kind === "policy_violation") {
+      stats.policyStats.violations++;
+      stats.policyStats.blocks++;
+      stats.policyStats.recentViolations.push(`${e.ts?.slice(11, 19) ?? "?"} ${(e.summary ?? "").slice(0, 80)}`);
+    }
+    if (e.kind === "policy_warning") {
+      stats.policyStats.warnings++;
+    }
+    if (e.kind === "policy_block") {
+      stats.policyStats.blocks++;
+    }
+    if (e.kind === "tool_invocation") {
+      stats.policyStats.toolInvocations++;
+    }
+    if (e.kind === "policy_escalation") {
+      stats.policyStats.violations++;
+      stats.policyStats.recentViolations.push(`${e.ts?.slice(11, 19) ?? "?"} ESCALATION: ${(e.summary ?? "").slice(0, 70)}`);
     }
   }
 
@@ -222,6 +243,25 @@ export function renderDashboard(logPath: string): string {
       const pct = parseInt(v.uptime);
       const color = pct >= 95 ? GREEN : pct >= 70 ? ORANGE : RED;
       lines.push(`  ${WHITE}${name.padEnd(16)}${RST} ${color}${v.uptime.padStart(5)}${RST}  ${DIM}${v.checks} checks  ${v.failures} fails${RST}`);
+    }
+    lines.push("");
+  }
+
+  // ── Policy ──
+  const ps = s.policyStats;
+  if (ps.violations > 0 || ps.warnings > 0 || ps.toolInvocations > 0) {
+    lines.push(sectionHeader("  POLICY"));
+    const vColor = ps.violations > 0 ? RED : GREEN;
+    const wColor = ps.warnings > 0 ? ORANGE : GREEN;
+    lines.push(`  ${BLD}Violations${RST} ${vColor}${ps.violations}${RST}    ${BLD}Warnings${RST} ${wColor}${ps.warnings}${RST}    ${BLD}Blocks${RST} ${RED}${ps.blocks}${RST}    ${BLD}Tool Audit${RST} ${DIM}${ps.toolInvocations}${RST}`);
+    if (ps.recentViolations.length > 0) {
+      const recent = ps.recentViolations.slice(-5);
+      for (const v of recent) {
+        lines.push(`  ${RED}!${RST} ${DIM}${v}${RST}`);
+      }
+    }
+    if (ps.violations === 0 && ps.blocks === 0) {
+      lines.push(`  ${GREEN}clean — no violations${RST}`);
     }
     lines.push("");
   }

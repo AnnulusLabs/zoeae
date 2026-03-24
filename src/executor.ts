@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { dirname, resolve, join, basename } from "node:path";
 import { ActivityLog } from "./activity-log.js";
+import type { PolicyEngine } from "./policy.js";
 
 export type ExecResult = {
   stdout: string;
@@ -35,8 +36,18 @@ export async function shellExec(
     cwd?: string;
     shell?: string;
     log?: ActivityLog;
+    policy?: PolicyEngine;
   },
 ): Promise<ExecResult> {
+  // Policy: check command before execution
+  if (opts?.policy) {
+    const v = opts.policy.checkCommand(command);
+    if (!v.allowed) {
+      opts?.log?.emit("policy_block", `shellExec blocked: ${v.reason}`);
+      return { stdout: "", stderr: `POLICY BLOCKED: ${v.reason}`, exitCode: 126, timedOut: false, durationMs: 0 };
+    }
+  }
+
   const timeoutMs = opts?.timeoutMs ?? 30_000;
   const cwd = opts?.cwd ?? process.env.HOME ?? process.env.USERPROFILE ?? ".";
   const shell = opts?.shell ?? (process.platform === "win32" ? "powershell.exe" : "/bin/bash");
@@ -73,21 +84,42 @@ export async function shellExec(
 
 // ── File Operations ──────────────────────────────────────────────────
 
-export function readFile(path: string, log?: ActivityLog): string {
+export function readFile(path: string, log?: ActivityLog, policy?: PolicyEngine): string {
   const resolved = resolve(path);
+  if (policy) {
+    const v = policy.checkPathRead(resolved);
+    if (!v.allowed) {
+      log?.emit("policy_block", `readFile blocked: ${v.reason}`);
+      throw new Error(`POLICY BLOCKED: ${v.reason}`);
+    }
+  }
   log?.emit("file_read", `read ${basename(resolved)}`, { meta: { path: resolved } });
   return readFileSync(resolved, "utf-8");
 }
 
-export function writeFile(path: string, content: string, log?: ActivityLog): void {
+export function writeFile(path: string, content: string, log?: ActivityLog, policy?: PolicyEngine): void {
   const resolved = resolve(path);
+  if (policy) {
+    const v = policy.checkPathWrite(resolved);
+    if (!v.allowed) {
+      log?.emit("policy_block", `writeFile blocked: ${v.reason}`);
+      throw new Error(`POLICY BLOCKED: ${v.reason}`);
+    }
+  }
   mkdirSync(dirname(resolved), { recursive: true });
   writeFileSync(resolved, content, "utf-8");
   log?.emit("file_write", `write ${basename(resolved)} (${content.length} chars)`, { meta: { path: resolved } });
 }
 
-export function appendToFile(path: string, content: string, log?: ActivityLog): void {
+export function appendToFile(path: string, content: string, log?: ActivityLog, policy?: PolicyEngine): void {
   const resolved = resolve(path);
+  if (policy) {
+    const v = policy.checkPathWrite(resolved);
+    if (!v.allowed) {
+      log?.emit("policy_block", `appendToFile blocked: ${v.reason}`);
+      throw new Error(`POLICY BLOCKED: ${v.reason}`);
+    }
+  }
   mkdirSync(dirname(resolved), { recursive: true });
   appendFileSync(resolved, content, "utf-8");
   log?.emit("file_write", `append ${basename(resolved)} (+${content.length} chars)`, { meta: { path: resolved } });
@@ -111,8 +143,15 @@ export function fileExists(path: string): boolean {
   return existsSync(resolve(path));
 }
 
-export function deleteFile(path: string, log?: ActivityLog): boolean {
+export function deleteFile(path: string, log?: ActivityLog, policy?: PolicyEngine): boolean {
   const resolved = resolve(path);
+  if (policy) {
+    const v = policy.checkPathWrite(resolved);
+    if (!v.allowed) {
+      log?.emit("policy_block", `deleteFile blocked: ${v.reason}`);
+      return false;
+    }
+  }
   try {
     unlinkSync(resolved);
     log?.emit("file_write", `delete ${basename(resolved)}`, { meta: { path: resolved } });

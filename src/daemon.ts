@@ -20,11 +20,15 @@ import { OllamaClient, type ChatResult } from "./ollama-client.js";
 import { AutonomyClient } from "./autonomy-client.js";
 import { ActivityLog } from "./activity-log.js";
 import { DreamEngine, type DreamConfig } from "./dream-engine.js";
+import { PolicyEngine, type ExecutionContext, type EscalationLevel } from "./policy.js";
 import { join } from "node:path";
 
 // ═══════════════════════════════════════════════════════════════════════
 // CONFIG
 // ═══════════════════════════════════════════════════════════════════════
+
+/** Metabolic tier — maps power state to daemon behavior */
+export type MetabolicTier = "thriving" | "active" | "conserving" | "encysted";
 
 export type DaemonConfig = {
   enabled: boolean;
@@ -73,23 +77,8 @@ const DEFAULTS: DaemonConfig = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════
-// SAFEGUARDS
+// SAFEGUARDS — enforced by PolicyEngine (loaded from safety.yaml)
 // ═══════════════════════════════════════════════════════════════════════
-
-const COMMAND_DENYLIST = [
-  "rm -rf /", "rm -rf ~", "rm -rf .", "dd if=", "dd of=",
-  "mkfs", "diskpart", ":(){", "chmod -R 777 /",
-  "Clear-Disk", "Disable-PnpDevice", "Format-Volume",
-  "> /dev/sda", "shutdown", "reboot", "init 0", "init 6",
-];
-
-function isCommandBlocked(cmd: string): string | null {
-  const lower = cmd.toLowerCase();
-  for (const pat of COMMAND_DENYLIST) {
-    if (lower.includes(pat.toLowerCase())) return pat;
-  }
-  return null;
-}
 
 // ═══════════════════════════════════════════════════════════════════════
 // TYPES
@@ -142,6 +131,7 @@ export class Daemon {
   private ollama: OllamaClient;
   private autonomy: AutonomyClient;
   private log: ActivityLog;
+  private policy: PolicyEngine;
   private running = false;
   private tickCount = 0;
   private _lastMessageAt = 0;
@@ -151,18 +141,120 @@ export class Daemon {
   private _replanCounts = new Map<string, number>(); // task ID → replan count
   // Phase 3: genome-learned validation stats
   private _validationStats = { passed: 0, failed: 0, avgConfidence: 0.7 };
+  // Metabolic awareness — energy-gated behavior
+  private _metabolicTier: MetabolicTier = "active";
+  private _powerLevel = 1.0; // 0.0-1.0, externally set
 
   constructor(
     tasks: TaskEngine,
     autonomy: AutonomyClient,
     log: ActivityLog,
     config?: Partial<DaemonConfig>,
+    policy?: PolicyEngine,
   ) {
     this.cfg = { ...DEFAULTS, ...config };
     this.tasks = tasks;
     this.autonomy = autonomy;
     this.log = log;
     this.ollama = new OllamaClient(this.cfg.ollamaUrl, 120_000);
+
+    // Load policy — override budgets from safety.yaml
+    if (policy) {
+      this.policy = policy;
+    } else {
+      const pluginDir = join(process.env.HOME ?? process.env.USERPROFILE ?? ".", ".openclaw", "extensions", "zoeae");
+      this.policy = new PolicyEngine(join(pluginDir, "safety.yaml"), log);
+    }
+    const budgets = this.policy.getBudgets();
+    this.cfg.maxOllamaCallsPerTick = config?.maxOllamaCallsPerTick ?? budgets.maxOllamaCallsPerTick;
+    this.cfg.tickTimeBudgetMs = config?.tickTimeBudgetMs ?? budgets.tickTimeBudgetMs;
+    this.cfg.maxGoalSteps = config?.maxGoalSteps ?? budgets.maxGoalSteps;
+    this.cfg.maxGoalReplans = config?.maxGoalReplans ?? budgets.maxGoalReplans;
+    this.cfg.roomValidationThreshold = config?.roomValidationThreshold ?? budgets.roomValidationThreshold;
+  }
+
+  getPolicy(): PolicyEngine { return this.policy; }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // METABOLIC AWARENESS — energy-gated behavior tiers
+  // ═══════════════════════════════════════════════════════════════════
+  //
+  // Thriving  (>0.75): full daemon, dreams active, all task priorities, room validation
+  // Active   (0.40-0.75): normal daemon, dreams paused, P1-P3 tasks only
+  // Conserving (0.15-0.40): slow ticks, no dreams, P1-P2 only, no room validation
+  // Encysted  (<0.15): serialize state, stop daemon, hibernate until power recovers
+
+  setPowerLevel(level: number): MetabolicTier {
+    this._powerLevel = Math.min(1, Math.max(0, level));
+    const prev = this._metabolicTier;
+
+    if (this._powerLevel > 0.75) {
+      this._metabolicTier = "thriving";
+    } else if (this._powerLevel > 0.40) {
+      this._metabolicTier = "active";
+    } else if (this._powerLevel > 0.15) {
+      this._metabolicTier = "conserving";
+    } else {
+      this._metabolicTier = "encysted";
+    }
+
+    if (this._metabolicTier !== prev) {
+      this.log.emit("metabolic", `tier change: ${prev} → ${this._metabolicTier} (power=${(this._powerLevel * 100).toFixed(0)}%)`);
+
+      // Encyst: stop everything, serialize state
+      if (this._metabolicTier === "encysted" && this.running) {
+        this.log.emit("metabolic", "encysting: serializing state and hibernating");
+        if (this.dreamer) this.dreamer.stop();
+        this.stop();
+      }
+
+      // Wake from encystment
+      if (prev === "encysted" && this._metabolicTier !== "encysted" && !this.running) {
+        this.log.emit("metabolic", "waking from encystment");
+        this.start();
+      }
+
+      // Dream control
+      if (this.dreamer) {
+        if (this._metabolicTier === "thriving" && !this.dreamer.isRunning()) {
+          this.dreamer.start();
+          this.log.emit("metabolic", "dreams resumed (thriving)");
+        } else if (this._metabolicTier !== "thriving" && this.dreamer.isRunning()) {
+          this.dreamer.stop();
+          this.log.emit("metabolic", "dreams paused (conserving energy)");
+        }
+      }
+    }
+
+    return this._metabolicTier;
+  }
+
+  getPowerLevel(): number { return this._powerLevel; }
+  getMetabolicTier(): MetabolicTier { return this._metabolicTier; }
+
+  /** Get effective config modulated by metabolic tier */
+  private metabolicTasksPerTick(): number {
+    switch (this._metabolicTier) {
+      case "thriving": return this.cfg.maxTasksPerTick;
+      case "active": return Math.min(this.cfg.maxTasksPerTick, 2);
+      case "conserving": return 1;
+      case "encysted": return 0;
+    }
+  }
+
+  /** Get max task priority allowed in current tier (lower = higher priority) */
+  private metabolicMaxPriority(): number {
+    switch (this._metabolicTier) {
+      case "thriving": return 5;  // all priorities
+      case "active": return 3;    // P1-P3 only
+      case "conserving": return 2; // P1-P2 only
+      case "encysted": return 0;  // nothing
+    }
+  }
+
+  /** Whether room validation is allowed in current tier */
+  private metabolicAllowRoom(): boolean {
+    return this._metabolicTier === "thriving";
   }
 
   /** Inject planner for Phase 3 goal execution */
@@ -176,7 +268,21 @@ export class Daemon {
       this.dreamer = new DreamEngine(
         this.ollama, this.log,
         () => this.idleMs(),
-        config,
+        {
+          resourceGated: true,
+          onPromote: (dream, actionPlan) => {
+            const domains = dream.facts.map((f) => f.domain).join(" ↔ ");
+            this.tasks.add({
+              name: `[dream] ${domains}: ${dream.bridge.slice(0, 50)}`,
+              description: `Dream bridge (q=${dream.quality.toFixed(2)}):\n${dream.bridge}\n\nAction plan:\n${actionPlan}`,
+              taskType: "research",
+              priority: 3,
+              tags: ["dream", "promoted", ...dream.facts.map((f) => f.domain)],
+            });
+            this.log.emit("genome_event", `dream → task: [${domains}] ${actionPlan.slice(0, 80)}`);
+          },
+          ...config,
+        },
       );
     }
     this.dreamer.start();
@@ -193,6 +299,11 @@ export class Daemon {
     this.timer = setInterval(() => {
       this.tick().catch((e) => this.log.emit("error", `daemon tick failed: ${e}`));
     }, this.cfg.intervalMs);
+    // Auto-enable dreaming — the organism dreams when idle
+    if (!this.dreamer) {
+      this.enableDreaming();
+      this.log.emit("info", "dream engine auto-enabled on daemon start");
+    }
     return true;
   }
 
@@ -225,6 +336,21 @@ export class Daemon {
     if (this._ollamaCallsThisTick >= this.cfg.maxOllamaCallsPerTick) {
       return { ok: false, content: "", error: "Ollama call cap reached for this tick" };
     }
+
+    // Policy: check model allowlist
+    const modelVerdict = this.policy.checkModel(model);
+    if (!modelVerdict.allowed) {
+      this.log.emit("policy_violation", `Model blocked: ${modelVerdict.reason}`);
+      return { ok: false, content: "", error: `POLICY: ${modelVerdict.reason}` };
+    }
+
+    // Policy: check session inference budget
+    const budgetVerdict = this.policy.checkInferenceBudget();
+    if (!budgetVerdict.allowed) {
+      this.log.emit("policy_violation", `Inference budget: ${budgetVerdict.reason}`);
+      return { ok: false, content: "", error: `POLICY: ${budgetVerdict.reason}` };
+    }
+
     this._ollamaCallsThisTick++;
     return this.ollama.chatResult(model, messages);
   }
@@ -608,8 +734,14 @@ export class Daemon {
   }
 
   private async _tickInner(tickStart: number): Promise<{ health: number; tasksProcessed: number; consolidated: boolean }> {
+    // Metabolic gate: don't tick if encysted
+    if (this._metabolicTier === "encysted") {
+      this.log.emit("metabolic", "tick skipped: encysted");
+      return { health: 0, tasksProcessed: 0, consolidated: false };
+    }
+
     this.tickCount++;
-    this.log.emit("daemon_tick", `tick #${this.tickCount} start`);
+    this.log.emit("daemon_tick", `tick #${this.tickCount} start [${this._metabolicTier}]`);
     let healthUp = 0;
     let tasksProcessed = 0;
     let consolidated = false;
@@ -634,16 +766,23 @@ export class Daemon {
         } else {
           this.log.emit("service_check", `${s.name} DOWN: ${s.error?.slice(0, 100)}`);
           if (this.cfg.autoRestart) {
-            await restartService(s.name, this.log);
+            const restartVerdict = this.policy.checkServiceRestart(s.name);
+            if (restartVerdict.allowed) {
+              await restartService(s.name, this.log);
+            } else {
+              this.log.emit("policy_violation", `Service restart throttled: ${restartVerdict.reason}`);
+            }
           }
         }
       }
     }
 
-    // Task processing with inner loop
-    if (this.cfg.taskProcessing) {
+    // Task processing with inner loop (metabolic-gated)
+    const maxTasks = this.metabolicTasksPerTick();
+    const maxPriority = this.metabolicMaxPriority();
+    if (this.cfg.taskProcessing && maxTasks > 0) {
       let processed = 0;
-      while (processed < this.cfg.maxTasksPerTick) {
+      while (processed < maxTasks) {
         if (Date.now() - tickStart > this.cfg.tickTimeBudgetMs) {
           this.log.emit("daemon_tick", `tick time budget exhausted`);
           break;
@@ -651,8 +790,16 @@ export class Daemon {
 
         const task = this.tasks.next();
         if (!task) break;
+
+        // Metabolic filter: skip tasks below our energy tier
+        if (task.priority > maxPriority) {
+          this.log.emit("metabolic", `skipping ${task.id} (P${task.priority}) — tier ${this._metabolicTier} only runs P1-P${maxPriority}`);
+          processed++;
+          continue;
+        }
+
         this.tasks.start(task.id);
-        this.log.emit("task_event", `processing: ${task.name} (${task.taskType})`);
+        this.log.emit("task_event", `processing: ${task.name} (${task.taskType}) [${this._metabolicTier}]`);
 
         try {
           const { result, exitCode } = await this.executeTask(task);
@@ -662,13 +809,14 @@ export class Daemon {
             continue;
           }
 
-          // Phase 2: Use room validation for P1-P2 priority tasks
+          // Phase 2: Use room validation for P1-P2 priority tasks (if metabolically allowed)
           const isHighPriority = task.priority <= 2;
-          const validation = isHighPriority
+          const useRoom = isHighPriority && this.metabolicAllowRoom();
+          const validation = useRoom
             ? await this.validateWithRoom(task, result)
             : await this.validateResult(task, result, exitCode);
 
-          this.log.emit("inner_loop", `${task.id} validated: pass=${validation.pass} conf=${validation.confidence.toFixed(2)}${isHighPriority ? " [room]" : ""}${validation.critique ? ` "${validation.critique.slice(0, 60)}"` : ""}`);
+          this.log.emit("inner_loop", `${task.id} validated: pass=${validation.pass} conf=${validation.confidence.toFixed(2)}${useRoom ? " [room]" : ""}${validation.critique ? ` "${validation.critique.slice(0, 60)}"` : ""}`);
 
           if (validation.pass) {
             this.tasks.complete(task.id, result);
@@ -733,14 +881,22 @@ export class Daemon {
 
   private async executeTask(task: Task): Promise<{ result: string | null; exitCode?: number }> {
     if (task.taskType === "shell" && task.command) {
-      const blocked = isCommandBlocked(task.command);
-      if (blocked) {
-        this.tasks.block(task.id, `BLOCKED: denylist match "${blocked}"`);
-        this.log.emit("inner_loop", `${task.id} BLOCKED: denylist "${blocked}"`);
+      const verdict = this.policy.checkCommand(task.command);
+      if (!verdict.allowed) {
+        this.tasks.block(task.id, `POLICY BLOCKED: ${verdict.reason}`);
+        this.log.emit("policy_violation", `${task.id} BLOCKED: ${verdict.reason} (rule: ${verdict.rule})`);
+        this.policy.recordViolation(verdict.level as EscalationLevel);
         return { result: null };
       }
 
-      const exec = await shellExec(task.command, { timeoutMs: 60_000, log: this.log });
+      // Check tool policy for shell in daemon context
+      const toolVerdict = this.policy.checkTool("shell", "daemon");
+      if (!toolVerdict.allowed) {
+        this.tasks.block(task.id, `TOOL POLICY: ${toolVerdict.reason}`);
+        return { result: null };
+      }
+
+      const exec = await shellExec(task.command, { timeoutMs: 60_000, log: this.log, policy: this.policy });
       const result = exec.exitCode === 0
         ? exec.stdout || "OK"
         : `EXIT ${exec.exitCode}: ${exec.stderr}`;
@@ -811,12 +967,16 @@ export class Daemon {
     ticking: boolean; ollamaCallsLastTick: number;
     validationStats: typeof this._validationStats;
     adaptiveThreshold: number;
+    metabolicTier: MetabolicTier;
+    powerLevel: number;
   } {
     return {
       running: this.running, tickCount: this.tickCount, config: this.cfg,
       ticking: this._ticking, ollamaCallsLastTick: this._ollamaCallsThisTick,
       validationStats: { ...this._validationStats },
       adaptiveThreshold: this.adaptiveThreshold(),
+      metabolicTier: this._metabolicTier,
+      powerLevel: this._powerLevel,
     };
   }
 }

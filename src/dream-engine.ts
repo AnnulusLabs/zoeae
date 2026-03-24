@@ -34,6 +34,12 @@ export type DreamConfig = {
   knowledgePaths: string[];
   /** Where to write dreams */
   journalPath: string;
+  /** Resource-gated mode: dream whenever Ollama is available, not just idle */
+  resourceGated: boolean;
+  /** Quality threshold to expand a bridge into an actionable task */
+  expandThreshold: number;
+  /** Callback when a dream is promoted to actionable */
+  onPromote?: (dream: Dream, actionPlan: string) => void;
 };
 
 const DEFAULTS: DreamConfig = {
@@ -49,6 +55,8 @@ const DEFAULTS: DreamConfig = {
     "A:/AI/KERF/.kerf",
   ],
   journalPath: "A:/AI/KERF/.kerf/dreams.jsonl",
+  resourceGated: true,
+  expandThreshold: 0.8,
 };
 
 export type Dream = {
@@ -199,7 +207,11 @@ export class DreamEngine {
   private async _maybeDream(): Promise<void> {
     if (!this.cfg.enabled) return;
     if (this.dreamCount >= this.cfg.maxDreamsPerSession) return;
-    if (this._idleCheck() < this.cfg.minIdleMs) return;
+
+    // Resource-gated: dream whenever Ollama responds (system has spare capacity)
+    // Idle-gated (legacy): dream only after minIdleMs of inactivity
+    if (!this.cfg.resourceGated && this._idleCheck() < this.cfg.minIdleMs) return;
+
     if (!(await this.ollama.ping())) return;
     await this._dream();
   }
@@ -245,6 +257,15 @@ export class DreamEngine {
       this.log.emit("genome_event",
         `${dreamId} KEPT (q=${quality.toFixed(2)}): [${picked.map(f => f.domain).join("↔")}] ${bridge.slice(0, 100)}`
       );
+
+      // Promote high-quality dreams: expand into actionable plan
+      if (quality >= this.cfg.expandThreshold && this.cfg.onPromote) {
+        const actionPlan = await this._expandBridge(bridge, picked);
+        if (actionPlan) {
+          this.log.emit("genome_event", `${dreamId} PROMOTED: ${actionPlan.slice(0, 100)}`);
+          this.cfg.onPromote(dream, actionPlan);
+        }
+      }
     } else {
       this.log.emit("info",
         `${dreamId} discarded (q=${quality.toFixed(2)}): ${bridge.slice(0, 80)}`
@@ -252,6 +273,28 @@ export class DreamEngine {
     }
 
     return dream;
+  }
+
+  private async _expandBridge(bridge: string, facts: RawFact[]): Promise<string | null> {
+    const prompt = [
+      "A creative recombination engine found this cross-domain connection:",
+      "",
+      `Domains: ${facts.map(f => f.domain).join(" ↔ ")}`,
+      `Facts: ${facts.map(f => `[${f.domain}] ${f.content.slice(0, 150)}`).join("\n")}`,
+      `Bridge: ${bridge}`,
+      "",
+      "Turn this into a concrete, actionable research task or experiment.",
+      "What specific thing should be built, tested, or investigated?",
+      "Be specific: name tools, methods, data sources, expected outcomes.",
+      "One paragraph, max 4 sentences. Start with a verb.",
+    ].join("\n");
+
+    const r = await this.ollama.chatResult(this.cfg.model, [
+      { role: "user", content: prompt },
+    ]);
+
+    if (!r.ok || r.content.length < 30) return null;
+    return r.content.trim().slice(0, 600);
   }
 
   private _pickDiverseFacts(n: number): RawFact[] {

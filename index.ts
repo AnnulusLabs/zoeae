@@ -31,6 +31,8 @@ import { checkAllServices, restartService, formatServiceStatus } from "./src/ser
 import { Daemon } from "./src/daemon.js";
 import { McpServer } from "./src/mcp-server.js";
 import { renderDashboard } from "./src/dashboard.js";
+import { PolicyEngine } from "./src/policy.js";
+import { AgentPool, type AgentConfig } from "./src/agent-pool.js";
 import { join } from "node:path";
 
 // ═══════════════════════════════════════════════════════════════
@@ -128,8 +130,10 @@ const zoeae = {
     let _tasks: TaskEngine | null = null;
     let _planner: Planner | null = null;
     let _daemon: Daemon | null = null;
+    let _pool: AgentPool | null = null;
     let _log: ActivityLog | null = null;
     let _mcp: McpServer | null = null;
+    let _policy: PolicyEngine | null = null;
     // Dashboard is now stateless — renderDashboard() called on demand via tool
 
     function getCfg(): ClawConfig {
@@ -147,6 +151,13 @@ const zoeae = {
     function getLog(): ActivityLog {
       if (!_log) _log = new ActivityLog(join(WORKSPACE, "activity.jsonl"));
       return _log;
+    }
+    function getPolicy(): PolicyEngine {
+      if (!_policy) {
+        const pluginDir = join(process.env.HOME ?? process.env.USERPROFILE ?? ".", ".openclaw", "extensions", "zoeae");
+        _policy = new PolicyEngine(join(pluginDir, "safety.yaml"), getLog());
+      }
+      return _policy;
     }
     function getTasks(): TaskEngine {
       if (!_tasks) _tasks = new TaskEngine(join(WORKSPACE, ".zoeae", "tasks.json"));
@@ -168,11 +179,23 @@ const zoeae = {
           intervalMs: getCfg().daemonIntervalMs,
           ollamaUrl: getCfg().ollamaUrl,
           defaultModel: getCfg().defaultModel,
-        });
+        }, getPolicy());
         // Phase 3: inject planner for executeGoal()
         _daemon.setPlanner(getPlanner());
       }
       return _daemon;
+    }
+
+    function getPool(): AgentPool {
+      if (!_pool) {
+        _pool = new AgentPool(
+          getOllama(),
+          getDaemon().getDreamer() ?? getDaemon().enableDreaming(),
+          getLog(),
+          getPolicy(),
+        );
+      }
+      return _pool;
     }
 
     async function getNucleus(): Promise<string> {
@@ -415,10 +438,16 @@ const zoeae = {
           required: ["command"],
         },
         async execute(args: { command: string; cwd?: string; timeout_ms?: number }) {
+          // Tool policy check (interactive context)
+          const policy = getPolicy();
+          const tv = policy.checkTool("shell", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           const result = await shellExec(args.command, {
             timeoutMs: args.timeout_ms,
             cwd: args.cwd,
             log: getLog(),
+            policy,
           });
           return {
             content: [
@@ -448,15 +477,22 @@ const zoeae = {
           required: ["action", "path"],
         },
         async execute(args: { action: string; path: string; content?: string }) {
+          const policy = getPolicy();
+          const log = getLog();
+
+          // Tool policy check (interactive context)
+          const tv = policy.checkTool("file", "interactive", args.action);
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           try {
             switch (args.action) {
               case "read":
-                return { content: readFile(args.path, getLog()) };
+                return { content: readFile(args.path, log, policy) };
               case "write":
-                writeFile(args.path, args.content ?? "", getLog());
+                writeFile(args.path, args.content ?? "", log, policy);
                 return { content: `Written ${(args.content ?? "").length} chars to ${args.path}` };
               case "append":
-                appendToFile(args.path, args.content ?? "", getLog());
+                appendToFile(args.path, args.content ?? "", log, policy);
                 return { content: `Appended ${(args.content ?? "").length} chars to ${args.path}` };
               case "list": {
                 const entries = listDir(args.path);
@@ -467,7 +503,7 @@ const zoeae = {
                 return { content: info ? `${info.isDir ? "DIR" : "FILE"} | ${info.size}B | Modified: ${info.modified}` : "Not found." };
               }
               case "delete":
-                return { content: deleteFile(args.path, getLog()) ? `Deleted ${args.path}` : `Not found: ${args.path}` };
+                return { content: deleteFile(args.path, log, policy) ? `Deleted ${args.path}` : `Not found: ${args.path}` };
               default:
                 return { content: `Unknown action: ${args.action}. Use: read, write, append, list, info, delete` };
             }
@@ -508,6 +544,9 @@ const zoeae = {
           required: ["action"],
         },
         async execute(args: Record<string, string | number | undefined>) {
+          const tv = getPolicy().checkTool("task", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           const tasks = getTasks();
           const log = getLog();
 
@@ -586,6 +625,9 @@ const zoeae = {
           required: ["action"],
         },
         async execute(args: Record<string, string | undefined>) {
+          const tv = getPolicy().checkTool("plan", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           const planner = getPlanner();
           const log = getLog();
 
@@ -676,6 +718,9 @@ const zoeae = {
           required: ["prompt"],
         },
         async execute(args: { prompt: string; model?: string; system?: string }) {
+          const tv = getPolicy().checkTool("delegate", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           const model = args.model ?? getCfg().defaultModel;
           const log = getLog();
           log.emit("delegate", `→ ${model}: ${args.prompt.slice(0, 80)}...`);
@@ -711,6 +756,9 @@ const zoeae = {
           required: ["action"],
         },
         async execute(args: { action: string; name?: string }) {
+          const tv = getPolicy().checkTool("services", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           switch (args.action) {
             case "status": {
               const statuses = await checkAllServices();
@@ -741,15 +789,20 @@ const zoeae = {
           "Control the autonomous background daemon. " +
           "When running, it processes the task queue, monitors service health, " +
           "auto-restarts dead services, and periodically consolidates the genome. " +
-          "Actions: start, stop, status, tick (run one cycle manually).",
+          "Metabolic awareness: set power level to modulate behavior (thriving/active/conserving/encysted). " +
+          "Actions: start, stop, status, tick, power.",
         parameters: {
           type: "object" as const,
           properties: {
-            action: { type: "string", description: "start|stop|status|tick" },
+            action: { type: "string", description: "start|stop|status|tick|power" },
+            value: { type: "number", description: "Power level 0.0-1.0 (for power action)" },
           },
           required: ["action"],
         },
-        async execute(args: { action: string }) {
+        async execute(args: { action: string; value?: number }) {
+          const tv = getPolicy().checkTool("daemon", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           const daemon = getDaemon();
           switch (args.action) {
             case "start":
@@ -759,14 +812,20 @@ const zoeae = {
             case "status": {
               const s = daemon.status();
               const vs = s.validationStats;
-              return { content: `Daemon: ${s.running ? "RUNNING" : "STOPPED"} | Ticks: ${s.tickCount} | Interval: ${s.config.intervalMs / 1000}s | Eval: ${s.config.evalModel}\nTicking: ${s.ticking} | Last Ollama calls: ${s.ollamaCallsLastTick}/${s.config.maxOllamaCallsPerTick}\nValidation: ${vs.passed} passed, ${vs.failed} failed, avg conf=${vs.avgConfidence.toFixed(2)}, threshold=${s.adaptiveThreshold.toFixed(2)}` };
+              const pwr = `${(s.powerLevel * 100).toFixed(0)}%`;
+              return { content: `Daemon: ${s.running ? "RUNNING" : "STOPPED"} | Ticks: ${s.tickCount} | Interval: ${s.config.intervalMs / 1000}s | Eval: ${s.config.evalModel}\nMetabolic: ${s.metabolicTier.toUpperCase()} (${pwr} power)\nTicking: ${s.ticking} | Last Ollama calls: ${s.ollamaCallsLastTick}/${s.config.maxOllamaCallsPerTick}\nValidation: ${vs.passed} passed, ${vs.failed} failed, avg conf=${vs.avgConfidence.toFixed(2)}, threshold=${s.adaptiveThreshold.toFixed(2)}` };
             }
             case "tick": {
               const result = await daemon.tick();
               return { content: `Tick: ${result.health} services healthy, ${result.tasksProcessed} tasks processed${result.consolidated ? ", genome consolidated" : ""}` };
             }
+            case "power": {
+              if (args.value === undefined) return { content: `Power: ${(daemon.getPowerLevel() * 100).toFixed(0)}% (${daemon.getMetabolicTier()})` };
+              const tier = daemon.setPowerLevel(args.value);
+              return { content: `Power set to ${(args.value * 100).toFixed(0)}% → metabolic tier: ${tier.toUpperCase()}` };
+            }
             default:
-              return { content: `Unknown action: ${args.action}. Use: start, stop, status, tick` };
+              return { content: `Unknown action: ${args.action}. Use: start, stop, status, tick, power` };
           }
         },
       }),
@@ -792,6 +851,9 @@ const zoeae = {
           required: ["query"],
         },
         async execute(args: { query: string; tier?: number }) {
+          const tv = getPolicy().checkTool("genome_search", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           try {
             const client = getClient();
             if (!(await client.ping())) return { content: "AUTONOMY not running. Use: services restart autonomy" };
@@ -821,6 +883,9 @@ const zoeae = {
         description: "Show cognitive genome health: nodes, edges, because coverage, domains, bridges.",
         parameters: { type: "object" as const, properties: {} },
         async execute() {
+          const tv = getPolicy().checkTool("genome_stats", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           try {
             const client = getClient();
             if (!(await client.ping())) return { content: "AUTONOMY not running." };
@@ -844,6 +909,9 @@ const zoeae = {
           required: ["pdb_id"],
         },
         async execute(args: { pdb_id: string }) {
+          const tv = getPolicy().checkTool("genome_ccm", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           try {
             const r = await getClient().computeCcm(args.pdb_id);
             return { content: r.success ? `PDB ${args.pdb_id}: CCM = ${r.ccm}` : `CCM failed: ${r.error}` };
@@ -878,6 +946,9 @@ const zoeae = {
           required: ["prompt"],
         },
         async execute(args: { prompt: string; mode?: string; task_type?: string }) {
+          const tv = getPolicy().checkTool("room_query", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           try {
             const room = getRoom();
             if (room.models.length === 0) return { content: "No models in room. Use room_manage to add models." };
@@ -924,6 +995,9 @@ const zoeae = {
           required: ["action"],
         },
         async execute(args: { action: string; value?: string }) {
+          const tv = getPolicy().checkTool("room_manage", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           try {
             const room = getRoom();
             const ollama = getOllama();
@@ -1001,6 +1075,9 @@ const zoeae = {
           },
         },
         async execute(args: { lines?: number; kind?: string }) {
+          const tv = getPolicy().checkTool("activity", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           try {
             const logPath = join(WORKSPACE, "activity.jsonl");
             const content = readFile(logPath);
@@ -1040,6 +1117,9 @@ const zoeae = {
           required: ["observation"],
         },
         async execute(args: { observation: string; because?: string; domain?: string; confidence?: number }) {
+          const tv = getPolicy().checkTool("reflect", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           const log = getLog();
           const entry = args.because
             ? `${args.observation} ∵ ${args.because}`
@@ -1099,6 +1179,9 @@ const zoeae = {
           required: ["goal"],
         },
         async execute(args: { goal: string; context?: string }) {
+          const tv = getPolicy().checkTool("goal", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           const daemon = getDaemon();
           const log = getLog();
 
@@ -1145,6 +1228,9 @@ const zoeae = {
           required: ["action"],
         },
         async execute(args: { action: string }) {
+          const tv = getPolicy().checkTool("dream", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           const daemon = getDaemon();
           switch (args.action) {
             case "start": {
@@ -1171,11 +1257,11 @@ const zoeae = {
               return {
                 content: [
                   `Dream: ${dream.id}`,
-                  `Domains: [${dream.domains.join(" ↔ ")}]`,
+                  `Domains: [${dream.facts.map((f) => f.domain).join(" ↔ ")}]`,
                   `Quality: ${dream.quality.toFixed(2)} ${dream.kept ? "KEPT" : "discarded"}`,
                   "",
                   `Facts:`,
-                  ...dream.facts.map((f, i) => `  ${i + 1}. ${f.slice(0, 120)}`),
+                  ...dream.facts.map((f, i) => `  ${i + 1}. [${f.domain}] ${f.content.slice(0, 120)}`),
                   "",
                   `Bridge: ${dream.bridge}`,
                 ].join("\n"),
@@ -1188,7 +1274,7 @@ const zoeae = {
               if (dreams.length === 0) return { content: "No dreams yet." };
               return {
                 content: dreams.map((dr) =>
-                  `${dr.ts.slice(0, 19)} [${dr.domains.join("↔")}] q=${dr.quality.toFixed(2)}${dr.kept ? " KEPT" : ""}: ${dr.bridge.slice(0, 80)}`
+                  `${dr.ts.slice(0, 19)} [${dr.facts.map((f) => f.domain).join("↔")}] q=${dr.quality.toFixed(2)}${dr.kept ? " KEPT" : ""}: ${dr.bridge.slice(0, 80)}`
                 ).join("\n"),
               };
             }
@@ -1199,7 +1285,7 @@ const zoeae = {
               if (bridges.length === 0) return { content: "No bridges found yet. Dreams need time." };
               return {
                 content: bridges.map((dr) =>
-                  `[${dr.domains.join(" ↔ ")}] (q=${dr.quality.toFixed(2)})\n  ${dr.bridge}`
+                  `[${dr.facts.map((f) => f.domain).join(" ↔ ")}] (q=${dr.quality.toFixed(2)})\n  ${dr.bridge}`
                 ).join("\n\n"),
               };
             }
@@ -1209,6 +1295,112 @@ const zoeae = {
         },
       }),
       { names: ["dream"] },
+    );
+
+    // ═══════════════════════════════════════════════════════
+    // TOOLS — Agent Pool (Multi-Instance)
+    // ═══════════════════════════════════════════════════════
+
+    api.registerTool(
+      () => ({
+        name: "pool",
+        description:
+          "Multi-instance agent pool — spawn, manage, and route work to multiple concurrent agents. " +
+          "Each agent has its own workspace, PTY, model, and policy scope. " +
+          "Actions: start (spawn default agents), stop, status, spawn <role> [name] [model], " +
+          "kill <id>, list, route <description>, scale-up <role>, scale-down <role>, health.",
+        parameters: {
+          type: "object" as const,
+          properties: {
+            action: { type: "string", description: "start|stop|status|spawn|kill|list|route|scale-up|scale-down|health" },
+            role: { type: "string", description: "orchestrator|builder|researcher|reviewer|dreamer|sentinel" },
+            name: { type: "string", description: "Human-friendly agent name" },
+            model: { type: "string", description: "Ollama model for this agent" },
+            id: { type: "string", description: "Agent ID (for kill)" },
+            task: { type: "string", description: "Task description (for route)" },
+          },
+          required: ["action"],
+        },
+        async execute(args: { action: string; role?: string; name?: string; model?: string; id?: string; task?: string }) {
+          const tv = getPolicy().checkTool("delegate", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
+          const pool = getPool();
+          switch (args.action) {
+            case "start": {
+              pool.start();
+              const agents = pool.list();
+              return {
+                content: `Agent pool started with ${agents.length} agents:\n` +
+                  agents.map(a => `  ${a.config.name} [${a.config.role}] (${a.config.model}) — ${a.state}`).join("\n"),
+              };
+            }
+            case "stop": {
+              pool.stop();
+              return { content: "Agent pool stopped. All agents terminated." };
+            }
+            case "status": {
+              const s = pool.status();
+              return {
+                content: `Agent Pool: ${s.agents.length} agents\n` +
+                  s.agents.map((a: any) =>
+                    `  ${a.name} [${a.role}] state=${a.state} tasks=${a.taskCount} idle=${Math.round(a.idleMs / 1000)}s model=${a.model}`
+                  ).join("\n"),
+              };
+            }
+            case "spawn": {
+              if (!args.role) return { content: "Specify role: orchestrator|builder|researcher|reviewer|dreamer|sentinel" };
+              const agent = pool.spawn({
+                role: args.role as any,
+                name: args.name || `${args.role}-${Date.now().toString(36).slice(-4)}`,
+                model: args.model || getCfg().defaultModel,
+                cwd: WORKSPACE,
+              });
+              return { content: `Spawned ${agent.config.name} [${agent.config.role}] id=${agent.config.id}` };
+            }
+            case "kill": {
+              if (!args.id) return { content: "Specify agent id to kill." };
+              pool.kill(args.id, "user request");
+              return { content: `Agent ${args.id} killed.` };
+            }
+            case "list": {
+              const agents = pool.list();
+              if (agents.length === 0) return { content: "No agents running. Use action=start." };
+              return {
+                content: agents.map(a =>
+                  `${a.config.id.slice(0, 8)} ${a.config.name.padEnd(20)} [${a.config.role.padEnd(12)}] ${a.state.padEnd(8)} tasks=${a.taskCount} files=${a.interactions.length}`
+                ).join("\n"),
+              };
+            }
+            case "route": {
+              if (!args.task) return { content: "Specify task description to route." };
+              const agentId = pool.assignTaskToRole(
+                args.role as any || "builder",
+                { description: args.task, priority: 5 } as any,
+              );
+              return { content: agentId ? `Task routed to agent ${agentId}` : "No available agent for this task. Queued." };
+            }
+            case "scale-up": {
+              if (!args.role) return { content: "Specify role to scale up." };
+              const agent = pool.scaleUp(args.role as any);
+              return { content: agent ? `Scaled up: spawned ${agent.config.name} [${agent.config.role}]` : `Failed to scale up ${args.role}` };
+            }
+            case "scale-down": {
+              if (!args.role) return { content: "Specify role to scale down." };
+              const killed = pool.scaleDown(args.role as any);
+              return { content: killed ? `Scaled down: killed least-busy ${args.role}` : `No ${args.role} agents to scale down` };
+            }
+            case "health": {
+              const issues = pool.healthCheck();
+              if (issues.length === 0) return { content: "All agents healthy." };
+              return { content: `Health issues:\n` + issues.map((i: string) => `  ⚠ ${i}`).join("\n") };
+            }
+            default:
+              return { content: `Unknown action: ${args.action}. Use: start, stop, status, spawn, kill, list, route, scale-up, scale-down, health` };
+          }
+        },
+      }),
+      { names: ["pool"] },
     );
 
     // ═══════════════════════════════════════════════════════
@@ -1231,6 +1423,9 @@ const zoeae = {
           required: ["action"],
         },
         async execute(args: { action: string; state?: string }) {
+          const tv = getPolicy().checkTool("genome_sync", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           try {
             const client = getClient();
             if (!(await client.ping())) return { content: "AUTONOMY not running." };
@@ -1279,6 +1474,9 @@ const zoeae = {
           required: ["action"],
         },
         async execute(args: { action: string }) {
+          const tv = getPolicy().checkTool("mcp", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           switch (args.action) {
             case "start": {
               if (_mcp?.isRunning()) return { content: "MCP server already running." };
@@ -1311,6 +1509,9 @@ const zoeae = {
           properties: {},
         },
         async execute() {
+          const tv = getPolicy().checkTool("dashboard", "interactive");
+          if (!tv.allowed) return { content: `POLICY BLOCKED: ${tv.reason}` };
+
           const output = renderDashboard(join(WORKSPACE, "activity.jsonl"));
           return { content: output };
         },
@@ -1417,7 +1618,7 @@ const zoeae = {
           console.log();
         });
       },
-      { commands: ["genome", "room", "tasks", "daemon", "services"] },
+      { commands: ["genome", "room", "tasks", "daemon", "services", "pool"] },
     );
   },
 };
