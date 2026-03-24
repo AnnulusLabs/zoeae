@@ -1,0 +1,29 @@
+[package]
+name = "zoeae"
+version = "0.6.0"
+edition = "2024"
+authors = ["AnnulusLabs LLC"]
+description = "Orchestration runtime with developmental perception"
+license = "MIT"
+repository = "https://github.com/AnnulusLabs/zoeae"
+keywords = ["orchestration", "runtime", "autonomous", "perception"]
+categories = ["command-line-utilities", "science"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+rayon = "1"
+rand = "0.8"
+chrono = "0.4"
+
+[dev-dependencies]
+assert_approx_eq = "1"
+
+[[bin]]
+name = "zoeae"
+path = "src/main.rs"
+
+[lib]
+name = "zoeae"
+path = "src/lib.rs"
