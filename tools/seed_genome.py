@@ -1,6 +1,6 @@
 """Seed the AUTONOMY genome with AnnulusLabs core knowledge."""
-import sys
-sys.path.insert(0, r'C:\Users\slows\.openclaw\workspace')
+import os, sys
+sys.path.insert(0, os.environ.get('OPENCLAW_WORKSPACE', os.path.expanduser('~/.openclaw/workspace')))
 from autonomy import *
 
 engine = get_engine()
