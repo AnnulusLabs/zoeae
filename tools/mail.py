@@ -45,8 +45,8 @@ log = logging.getLogger(__name__)
 OPERATOR_NUMBER = os.environ.get('OPENCLAW_OPERATOR_NUMBER', '')
 OPERATOR_EMAIL = os.environ.get('OPENCLAW_OPERATOR_EMAIL', '')
 NOX_FROM = os.environ.get('OPENCLAW_MAIL_FROM', 'openclaw@annuluslabs.com')
-MAIL_LOG = Path(os.environ.get('OPENCLAW_MAIL_LOG', 'A:/AI/KERF/.kerf/mail_log.jsonl'))
-MAIL_CONFIG = Path(os.environ.get('OPENCLAW_MAIL_CONFIG', 'A:/AI/KERF/.kerf/mail_config.json'))
+MAIL_LOG = Path(os.environ.get('OPENCLAW_MAIL_LOG', str(Path.home() / '.zoeae' / 'mail_log.jsonl')))
+MAIL_CONFIG = Path(os.environ.get('OPENCLAW_MAIL_CONFIG', str(Path.home() / '.zoeae' / 'mail_config.json')))
 
 CARRIER_GATEWAYS = {
     'tmobile':    '{number}@tmomail.net',

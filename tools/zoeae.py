@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Tuple
 
 KERF_API      = os.environ.get('KERF_API', 'http://127.0.0.1:8767')
 OLLAMA_API    = os.environ.get('OLLAMA_API', 'http://127.0.0.1:11434')
-DATA_DIR      = Path(os.environ.get('ZOEAE_DATA', 'A:/AI/KERF/.kerf'))
+DATA_DIR      = Path(os.environ.get('ZOEAE_DATA', str(Path.home() / '.zoeae')))
 ROOMS_DIR     = DATA_DIR / 'rooms'
 POSTMORTEM_DIR = DATA_DIR / 'postmortems'
 EXPERIMENT_DIR = DATA_DIR / 'experiments'
@@ -963,7 +963,7 @@ def main():
         elif cmd == 'devices':
             try:
                 import subprocess
-                r = subprocess.run(['python', 'A:/AI/RIGHT_TO_UPGRADE.py', 'scan'],
+                r = subprocess.run(['python', os.environ.get('RIGHT_TO_UPGRADE', 'right_to_upgrade.py'), 'scan'],
                                    capture_output=True, text=True, timeout=30)
                 if r.stdout: print(r.stdout)
                 if r.stderr: out('system', r.stderr[:300])
@@ -978,7 +978,7 @@ def main():
 
     # Cross-session continuity: write ANNULUS_STATE.md for Ghost Protocol
     try:
-        state_path = Path('A:/AI/ANNULUS_STATE.md')
+        state_path = Path(str(Path.home() / '.zoeae' / 'ANNULUS_STATE.md'))
         lines = [f'# Session State — {datetime.now().isoformat()[:19]}']
         lines.append(f'\n## Resume\nSession {session.d["id"]}, {session.d["prompts"]} prompts')
         if session.d.get('models'):
