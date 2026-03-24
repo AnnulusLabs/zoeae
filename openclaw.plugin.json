@@ -1,7 +1,7 @@
 {
   "id": "zoeae",
   "name": "Zoeae",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Living orchestration runtime — 7-channel antenna perception, developmental bleed, ecosystem orchestration (Courtyard, ToeBuster, FabNet, SensorNet, PatentGen, MeshNode), multi-model rooms, genome memory, autonomous daemon.",
   "kind": "tool",
   "configSchema": {

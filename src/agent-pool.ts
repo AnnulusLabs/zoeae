@@ -778,7 +778,8 @@ export class AgentRouter {
 // POOL PERSISTENCE
 // ═══════════════════════════════════════════════════════════════════════
 
-const PERSIST_PATH = join("A:/AI/KERF/.kerf", "agent-pool.json");
+import { paths } from "./paths.js";
+const PERSIST_PATH = paths.agentPool();
 const PERSIST_DEBOUNCE_MS = 2_000;
 
 /** PoolPersistence — atomic save/restore of pool state */

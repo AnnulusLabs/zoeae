@@ -26,7 +26,7 @@ spec_version: "0.1.0"
 plugin:
   id: "zoeae"
   name: "Zoeae"
-  version: "3.0.0"
+  version: "0.6.0"
   publisher: "annuluslabs"
   capabilities:
     - "shell"               # Spawns OS subprocesses

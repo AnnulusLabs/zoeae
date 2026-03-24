@@ -50,11 +50,14 @@ const DEFAULTS: DreamConfig = {
   maxDreamsPerSession: 50,
   minBridgeQuality: 0.6,
   factsPerDream: 2,
-  knowledgePaths: [
-    "A:/AI/claude_session_log.jsonl",
-    "A:/AI/KERF/.kerf",
-  ],
-  journalPath: "A:/AI/KERF/.kerf/dreams.jsonl",
+  knowledgePaths: ((): string[] => {
+    try { const { paths } = require("./paths.js"); return paths.knowledgePaths(); }
+    catch { return [process.env.ZOEAE_DATA ?? join(process.env.HOME ?? ".", ".zoeae", "data")]; }
+  })(),
+  journalPath: ((): string => {
+    try { const { paths } = require("./paths.js"); return paths.dreamJournal(); }
+    catch { return join(process.env.ZOEAE_DATA ?? join(process.env.HOME ?? ".", ".zoeae", "data"), "dreams.jsonl"); }
+  })(),
   resourceGated: true,
   expandThreshold: 0.8,
 };

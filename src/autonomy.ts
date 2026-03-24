@@ -37,7 +37,8 @@ import { shellExec } from "./executor.js";
 // SHARED PATHS
 // ═══════════════════════════════════════════════════════════════════════
 
-const KERF_DIR = "A:/AI/KERF/.kerf";
+import { getKerfDir, paths } from "./paths.js";
+const KERF_DIR = getKerfDir();
 
 // ═══════════════════════════════════════════════════════════════════════
 // PATTERN 1 — GENOME-DRIVEN HEARTBEAT

@@ -1,6 +1,6 @@
 {
   "name": "@openclaw/zoeae",
-  "version": "0.1.0",
+  "version": "0.6.0",
   "description": "Autonomous cognitive agent for OpenClaw — genome memory, shell execution, task queue, multi-model rooms, planning, service monitoring, background daemon",
   "type": "module",
   "author": "AnnulusLabs LLC <steve@annuluslabs.com>",
