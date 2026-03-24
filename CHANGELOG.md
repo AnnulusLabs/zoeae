@@ -11,7 +11,7 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 - Rust runtime: 225KB binary, 14 organs, zero runtime dependencies (`rust/`)
 - Three-runtime canonical layout: `rust/`, `ts/`, `python/`
 - PolicyEngine (`ts/src/policy.ts`) — enforces safety.yaml in-process
-- UMPH verification gate (`UMPH.md`) — 4-line atomic prompt, 8 reasoning flaws
+- Exoskeleton verification gate (`EXOSKELETON_GATE.md`) — 4-line atomic prompt, 8 reasoning flaws
 - K1C Moonraker bridge (`ts/src/k1c-bridge.ts`) — Creality K1C 3D printer integration
 - Ecosystem tools (`ts/src/ecosystem-tools.ts`) — 7 maker organs as OpenClaw skills (1,592 lines)
 - AgentPool (`ts/src/agent-pool.ts`) — persistent multi-agent coordination

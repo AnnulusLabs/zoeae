@@ -1,4 +1,4 @@
-# UMPH — Unified Micro-Protocol for Honesty
+# Exoskeleton Verification Gate
 
 **Verification gate for all shipped code.**
 
@@ -53,7 +53,7 @@ All three runtimes (Rust, TypeScript, Python) are gated by this protocol:
 - **TS plugin tools**: Every tool registered via `api.registerTool()` must have a documented failure mode in its description.
 - **Python organs**: Every organ method that calls external state (Blood, Nerve, Genome) must handle the case where that state is absent or corrupted.
 
-The `ExoSkeleton.inspect()` wrapper in both Python and Rust enforces this at runtime. UMPH enforces it at design time.
+The `ExoSkeleton.inspect()` wrapper in both Python and Rust enforces this at runtime. The Exoskeleton gate enforces it at design time.
 
 ---
 
