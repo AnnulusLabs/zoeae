@@ -2,3 +2,64 @@ node_modules/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Rust build
+target/
+*.pdb
+.cargo/config.toml
+
+# Secrets / env
+.env
+.env.*
+*.key
+*.pem
+CLAUDE.md
+
+# Local runtime / personal config
+.kerf/
+.openclaw/
+.zoeae/
+.claude/
+memory/
+logs/
+*.egg-info/
+
+# KERF stack (local only)
+kerf_*.py
+kerf_memory.db*
+.kerf_key
+.kerf_accounts.json
+bridge.jsonl
+activity.jsonl
+
+# Local scripts not for repo
+war_room.py
+autonomy.py
+dream_session.py
+esp32_hid_payload.py
+flash_hid.py
+
+# Screenshots / personal media
+*.png
+*.jpg
+*.com
+
+# Local docs not for repo
+AGENTS.md
+HEARTBEAT.md
+IDENTITY.md
+MEMORY.md
+SOUL.md
+TOOLS.md
+USER.md
+PERSISTENT_MEMORY_BENCHMARK.md
+dream-review-prompt.md
+ternary_radiation_research.md
+
+# Whitepapers / specs (local only)
+*.docx
+
+# Recovery / full backups
+zoeae_full/
+zoeae_recovered/
+inventions/
